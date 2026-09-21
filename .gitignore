@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual envs
+.venv/
+venv/
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Training / inference outputs (checkpoints, logs, viz, metrics)
+output/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+runs/
+wandb/
+lightning_logs/
+
+# Dataset artifacts (keep scripts under dataset/ if needed via negate)
+dataset/**
+!dataset/*.sh
+!dataset/*.py
+
+# Tooling caches / indexes (not model code)
+.codegraph/
+index/
+graphify-out/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local notes / scratch
+explain.md
+*.log
+*.csv
+!requirements.txt
