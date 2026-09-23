@@ -3,10 +3,12 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .blocks import DiTBlock, FinalLayer
 from .embeddings import LabelEmbedder, PatchEmbed, TimestepEmbedder
 from .ffc import FFCBlock
+from .hybrid import ConvDecoder, ConvStem, HoleRefine
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
@@ -37,16 +39,15 @@ def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nd
 
 
 class DiffusionTransformer(nn.Module):
-    """Blind-inpaint DiT at full resolution with optional FFC refinement.
+    """Blind-inpaint DiT: CNN stem → split cond tokens → mask-aware DiT → FFC → hole refine.
 
-    Pipeline: PatchEmbed → DiT (hole denoising) → unpatchify → FFC
-    (local + global features) at ``img_size``.
+    Input is still stacked ``[x_t, mask, masked]`` (3 channels) for train/infer compatibility.
     """
 
     def __init__(
         self,
         img_size: int = 256,
-        patch_size: int = 16,
+        patch_size: int = 8,
         in_channels: int = 3,
         hidden_size: int = 768,
         depth: int = 24,
@@ -58,27 +59,44 @@ class DiffusionTransformer(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         ffc_blocks: int = 4,
+        stem_channels: int = 64,
+        mid_channels: int = 64,
+        mask_attn_bias: float = 4.0,
     ):
         super().__init__()
         if img_size % patch_size != 0:
             raise ValueError(
                 f"img_size ({img_size}) must be divisible by patch_size ({patch_size})"
             )
+        if in_channels != 3:
+            raise ValueError("blind DiT expects in_channels=3 ([x_t, mask, masked])")
 
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.gt_channels = 1
+        self.out_channels = self.gt_channels * (2 if learn_sigma else 1)
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.depth = depth
         self.img_size = img_size
         self.ffc_blocks = int(ffc_blocks)
+        self.stem_channels = int(stem_channels)
+        self.mid_channels = int(mid_channels)
+        self.mask_attn_bias = float(mask_attn_bias)
 
-        self.x_embedder = PatchEmbed(img_size, patch_size, in_channels, hidden_size)
+        # CNN stem over stacked input, then patchify.
+        self.stem = ConvStem(in_channels=in_channels, out_channels=self.stem_channels)
+        self.feat_embedder = PatchEmbed(
+            img_size, patch_size, self.stem_channels, hidden_size
+        )
+        # Explicit mask / known-context token streams (added to stem tokens).
+        self.mask_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
+        self.masked_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
-        num_patches = self.x_embedder.num_patches
+        num_patches = self.feat_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList(
@@ -93,14 +111,16 @@ class DiffusionTransformer(nn.Module):
                 for _ in range(depth)
             ]
         )
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-
+        # Unpatchify to mid-channel maps; FFC runs here (not on 1-ch eps).
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.mid_channels)
         if self.ffc_blocks > 0:
             self.ffc = nn.Sequential(
-                *[FFCBlock(self.out_channels, ratio_global=0.5) for _ in range(self.ffc_blocks)]
+                *[FFCBlock(self.mid_channels, ratio_global=0.5) for _ in range(self.ffc_blocks)]
             )
         else:
             self.ffc = None
+        self.decoder = ConvDecoder(self.mid_channels, self.out_channels)
+        self.hole_refine = HoleRefine(self.out_channels)
 
         self.initialize_weights()
 
@@ -115,13 +135,14 @@ class DiffusionTransformer(nn.Module):
 
         pos_embed = get_2d_sincos_pos_embed(
             self.pos_embed.shape[-1],
-            int(self.x_embedder.num_patches**0.5),
+            int(self.feat_embedder.num_patches**0.5),
         )
         self.pos_embed.data.copy_(pos_embed.unsqueeze(0))
 
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
+        for embedder in (self.feat_embedder, self.mask_embedder, self.masked_embedder):
+            w = embedder.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(embedder.proj.bias, 0)
 
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -136,19 +157,22 @@ class DiffusionTransformer(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, C, img_size, img_size)
-        """
-        c = self.out_channels
+    def unpatchify(self, x: torch.Tensor, channels: int) -> torch.Tensor:
+        """``(N, T, patch**2 * C)`` → ``(N, C, H, W)``."""
         p = self.patch_size
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, channels))
         x = torch.einsum("nhwpqc->nchpwq", x)
-        return x.reshape(shape=(x.shape[0], c, h * p, w * p))
+        return x.reshape(shape=(x.shape[0], channels, h * p, w * p))
+
+    def _mask_attn_bias(self, mask: torch.Tensor) -> torch.Tensor:
+        """Soft bias: down-weight attention keys inside the hole (MAT-style)."""
+        # mask hole=1 → patch hole fraction in [0, 1]
+        patch_hole = F.avg_pool2d(mask, kernel_size=self.patch_size, stride=self.patch_size)
+        patch_hole = patch_hole.flatten(2)  # (B, 1, N)
+        # (B, 1, 1, N) broadcasts over heads and queries
+        return -self.mask_attn_bias * patch_hole.unsqueeze(2)
 
     def forward(
         self,
@@ -157,24 +181,36 @@ class DiffusionTransformer(nn.Module):
         y: torch.Tensor,
     ) -> torch.Tensor:
         """
-        x: (N, C, H, W) full-resolution blind input (``x_t``, mask, masked)
+        x: (N, 3, H, W) stacked ``x_t``, mask, masked
         t: (N,) diffusion timesteps
         y: (N,) class labels
-        returns: (N, out_channels, H, W) at full resolution
+        returns: (N, out_channels, H, W)
         """
-        x = self.x_embedder(x) + self.pos_embed
-        t = self.t_embedder(t)
-        y = self.y_embedder(y, self.training)
-        c = t + y
+        mask = x[:, 1:2]
+        masked = x[:, 2:3]
+
+        feat = self.stem(x)
+        tokens = (
+            self.feat_embedder(feat)
+            + self.mask_embedder(mask)
+            + self.masked_embedder(masked)
+            + self.pos_embed
+        )
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y, self.training)
+        c = t_emb + y_emb
+        attn_bias = self._mask_attn_bias(mask)
 
         for block in self.blocks:
-            x = block(x, c)
+            tokens = block(tokens, c, attn_bias=attn_bias)
 
-        x = self.final_layer(x, c)
-        x = self.unpatchify(x)
+        h = self.final_layer(tokens, c)
+        h = self.unpatchify(h, self.mid_channels)
         if self.ffc is not None:
-            x = self.ffc(x)
-        return x
+            h = self.ffc(h)
+        out = self.decoder(h)
+        out = self.hole_refine(out, mask)
+        return out
 
     def forward_with_cfg(
         self,
@@ -187,7 +223,7 @@ class DiffusionTransformer(nn.Module):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
-        eps, rest = model_out[:, : self.in_channels], model_out[:, self.in_channels :]
+        eps, rest = model_out[:, : self.gt_channels], model_out[:, self.gt_channels :]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
         eps = torch.cat([half_eps, half_eps], dim=0)

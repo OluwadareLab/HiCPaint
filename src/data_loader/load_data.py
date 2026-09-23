@@ -161,9 +161,8 @@ class CustomDataset:
         paths: List[str],
         seed: int,
         subset_fraction: float = 1.0,
-        max_samples: Optional[int] = None,
     ) -> List[str]:
-        """Keep a seeded prefix of ``paths`` by fraction and/or hard cap."""
+        """Keep a seeded random subset of ``paths`` by fraction."""
         n = len(paths)
         if n == 0:
             return paths
@@ -171,10 +170,6 @@ class CustomDataset:
         if not (0.0 < frac <= 1.0):
             raise ValueError(f"subset_fraction must be in (0, 1], got {frac}")
         n_keep = n if frac >= 1.0 else max(1, int(round(n * frac)))
-        if max_samples is not None:
-            n_keep = min(n_keep, max(0, int(max_samples)))
-        if n_keep <= 0:
-            return []
         if n_keep >= n:
             return list(paths)
         rng = np.random.default_rng(seed)
@@ -192,14 +187,12 @@ class CustomDataset:
         image_size: Optional[int] = None,
         augment: bool = False,
         subset_fraction: float = 1.0,
-        max_samples: Optional[int] = None,
     ) -> ImageDataset:
         del augment  # reserved; flips not applied to structured Hi-C yet
         paths = self._subset_paths(
             self._prep_paths(),
             seed=seed,
             subset_fraction=subset_fraction,
-            max_samples=max_samples,
         )
         return ImageDataset(
             image_paths=paths,

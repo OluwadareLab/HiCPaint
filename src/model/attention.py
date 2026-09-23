@@ -25,7 +25,11 @@ class BidirectionalSelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, n, c = x.shape
         qkv = (
             self.qkv(x)
@@ -35,6 +39,8 @@ class BidirectionalSelfAttention(nn.Module):
         q, k, v = qkv.unbind(0)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
+        if attn_bias is not None:
+            attn = attn + attn_bias
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
 
@@ -65,7 +71,11 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         b, n, c = x.shape
         qkv = (
             self.qkv(x)
@@ -78,7 +88,7 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
             q,
             k,
             v,
-            attn_mask=None,
+            attn_mask=attn_bias,
             dropout_p=self.attn_drop if self.training else 0.0,
             is_causal=False,
         )

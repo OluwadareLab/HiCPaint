@@ -65,10 +65,10 @@ def visualize_gt_masked_pred(
     device: torch.device,
     out_path: str,
     epoch: int,
-    sample_steps: int | None = 50,
-    t_value: int | None = None,
+    prediction: str = "x0",
+    infer_t: int = -1,
 ) -> None:
-    """Save fixed samples: gt | masked | predicted (multi-step blind inpaint)."""
+    """Save fixed samples: gt | masked | predicted (one-step blind inpaint)."""
     if not indices:
         return
     parent = os.path.dirname(out_path)
@@ -84,18 +84,9 @@ def visualize_gt_masked_pred(
         mask = sample["mask"].unsqueeze(0).to(device)
         masked = sample["masked"].unsqueeze(0).to(device)
         y = torch.zeros(1, dtype=torch.long, device=device)
-        if sample_steps is not None and hasattr(schedule, "inpaint"):
-            pred = schedule.inpaint(model, mask, masked, y=y, num_steps=sample_steps)
-        else:
-            # Fallback: one-step reconstruct at t_value (or mid schedule).
-            tv = int(t_value) if t_value is not None else max(1, schedule.num_timesteps // 2)
-            t = torch.full((1,), tv, device=device, dtype=torch.long)
-            x_t, _ = schedule.blind_q_sample(gt, mask, masked, t)
-            model_in = torch.cat([x_t, mask, masked], dim=1)
-            out = model(model_in, t, y)
-            eps = out[:, :1]
-            x0 = schedule.predict_x0_from_eps(x_t, t, eps)
-            pred = ((1.0 - mask) * masked + mask * x0).clamp(0.0, 1.0)
+        pred = schedule.inpaint_onestep(
+            model, mask, masked, y=y, t_value=infer_t, prediction=prediction
+        )
 
         panels = [
             (gt[0, 0].detach().cpu().numpy(), "gt"),
@@ -112,7 +103,7 @@ def visualize_gt_masked_pred(
             if col == 0:
                 ax.set_ylabel(f"idx={idx}", fontsize=9)
 
-    fig.suptitle(f"Best epoch {epoch}  (fixed samples, blind)", fontsize=12)
+    fig.suptitle(f"Best epoch {epoch}  (one-step x0, blind)", fontsize=12)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)

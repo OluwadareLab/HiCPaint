@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from src.configs import DEFAULT_CONFIG_PATH, config_to_train_defaults, load_config
 from src.data_loader.load_data import CustomDataset, ImageDataset
-from src.loss import AdversarialLoss, masked_mse_loss, masked_ssim_loss
+from src.loss import AdversarialLoss, masked_l1_loss, masked_mse_loss, masked_ssim_loss
 from src.metric import ValImageMetrics
 from src.model import DiffusionTransformer, PatchDiscriminator
 from src.utils import (
@@ -41,7 +41,6 @@ def build_dataloaders(
     num_workers: int = 4,
     seed: int = 42,
     subset_fraction: float = 1.0,
-    max_samples: Optional[int] = None,
     distributed: bool = False,
     rank: int = 0,
     world_size: int = 1,
@@ -68,7 +67,6 @@ def build_dataloaders(
             deterministic_masks=deterministic,
             image_size=image_size,
             subset_fraction=subset_fraction,
-            max_samples=max_samples,
         )
         sampler: Optional[DistributedSampler] = None
         if distributed and split == "train":
@@ -107,37 +105,12 @@ def _model_input(x_t: torch.Tensor, mask: torch.Tensor, masked: torch.Tensor) ->
     return torch.cat([x_t, mask, masked], dim=1)
 
 
-def _eps_pred(model_out: torch.Tensor, gt_channels: int = 1) -> torch.Tensor:
+def _pred_channels(model_out: torch.Tensor, gt_channels: int = 1) -> torch.Tensor:
     return model_out[:, :gt_channels]
 
 
 def _compose(mask: torch.Tensor, masked: torch.Tensor, x0: torch.Tensor) -> torch.Tensor:
     return ((1.0 - mask) * masked + mask * x0).clamp(0.0, 1.0)
-
-
-@torch.no_grad()
-def reconstruct_batch(
-    model: nn.Module,
-    schedule: DiffusionSchedule,
-    gt: torch.Tensor,
-    mask: torch.Tensor,
-    masked: torch.Tensor,
-    t_value: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One-step blind inpaint at fixed ``t_value``. Returns ``pred, noise, eps``.
-
-    ``gt`` is only used to build the noisy hole; model never sees clean gt.
-    """
-    b = gt.shape[0]
-    device = gt.device
-    t = torch.full((b,), int(t_value), device=device, dtype=torch.long)
-    x_t, noise = schedule.blind_q_sample(gt, mask, masked, t)
-    y = torch.zeros(b, dtype=torch.long, device=device)
-    out = model(_model_input(x_t, mask, masked), t, y)
-    eps = _eps_pred(out)
-    x0 = schedule.predict_x0_from_eps(x_t, t, eps)
-    pred = _compose(mask, masked, x0)
-    return pred, noise, eps
 
 
 @torch.no_grad()
@@ -147,9 +120,10 @@ def evaluate(
     schedule: DiffusionSchedule,
     device: torch.device,
     image_metrics: Optional[ValImageMetrics] = None,
-    sample_steps: Optional[int] = None,
+    prediction: str = "x0",
+    infer_t: int = -1,
 ) -> Dict[str, float]:
-    """Val/test: random-``t`` hole-MSE (matches train) + multi-step image metrics."""
+    """Val/test: train-matched hole loss + one-step image metrics."""
     model.eval()
     raw = unwrap_model(model)
     if image_metrics is not None:
@@ -160,27 +134,23 @@ def evaluate(
     for batch in tqdm(loader, desc="val", leave=False):
         gt, mask, masked = _prepare_batch(batch, device)
         b = gt.shape[0]
-        # Same t distribution as train — avoids fixed mid-t underestimating val_loss.
         t = torch.randint(0, schedule.num_timesteps, (b,), device=device)
         x_t, noise = schedule.blind_q_sample(gt, mask, masked, t)
         y = torch.zeros(b, dtype=torch.long, device=device)
         out = raw(_model_input(x_t, mask, masked), t, y)
-        eps = _eps_pred(out)
-        loss = masked_mse_loss(eps, noise, mask)
+        if prediction == "x0":
+            x0_pred = _pred_channels(out)
+            loss = masked_mse_loss(x0_pred, gt, mask)
+        else:
+            eps = _pred_channels(out)
+            loss = masked_mse_loss(eps, noise, mask)
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, eps)
         total += loss.item() * b
         count += b
         if image_metrics is not None:
-            if sample_steps is not None and int(sample_steps) > 0:
-                # Multi-step blind inpaint for PSNR/SSIM/FID (not one-step x0).
-                pred = schedule.inpaint(
-                    raw, mask, masked, y=y, num_steps=int(sample_steps)
-                )
-            else:
-                # Fast fallback: one-step x0 at low t (better hole quality than mid-t).
-                t_img = max(1, schedule.num_timesteps // 10)
-                pred, _, _ = reconstruct_batch(
-                    raw, schedule, gt, mask, masked, t_value=t_img
-                )
+            pred = schedule.inpaint_onestep(
+                raw, mask, masked, y=y, t_value=infer_t, prediction=prediction
+            )
             image_metrics.update(pred, gt, mask)
 
     metrics: Dict[str, float] = {"val_loss": total / max(1, count)}
@@ -204,9 +174,12 @@ def train_one_epoch(
     adv_t_max_frac: float = 0.5,
     ssim_weight: float = 0.1,
     ssim_t_max_frac: float = 0.5,
+    x0_l1_weight: float = 0.0,
+    x0_l1_t_max_frac: float = 0.3,
     use_adv: bool = False,
     use_ssim: bool = False,
     sampler: Optional[DistributedSampler] = None,
+    prediction: str = "x0",
 ) -> Dict[str, float]:
     """One training epoch with blind inpainting (noise only in the hole)."""
     model.train()
@@ -218,10 +191,13 @@ def train_one_epoch(
 
     use_adv = bool(use_adv) and adv_weight > 0
     use_ssim = bool(use_ssim) and ssim_weight > 0
+    use_x0_l1 = x0_l1_weight > 0
     t_max_adv = int(adv_t_max_frac * schedule.num_timesteps)
     t_max_ssim = int(ssim_t_max_frac * schedule.num_timesteps)
+    t_max_x0_l1 = int(x0_l1_t_max_frac * schedule.num_timesteps)
 
     sum_mse = 0.0
+    sum_x0_l1 = 0.0
     sum_ssim = 0.0
     sum_adv_g = 0.0
     sum_adv_d = 0.0
@@ -238,14 +214,23 @@ def train_one_epoch(
         y = torch.zeros(b, dtype=torch.long, device=device)
         adv_w = (t < t_max_adv).float() if use_adv else None
         ssim_w = (t < t_max_ssim).float() if use_ssim else None
+        x0_l1_w = (t < t_max_x0_l1).float() if use_x0_l1 else None
 
         optimizer_g.zero_grad(set_to_none=True)
         out = model(_model_input(x_t, mask, masked), t, y)
-        eps = _eps_pred(out)
-        loss_mse = masked_mse_loss(eps, noise, mask)
-
-        x0_pred = schedule.predict_x0_from_eps(x_t, t, eps)
+        if prediction == "x0":
+            x0_pred = _pred_channels(out)
+            loss_mse = masked_mse_loss(x0_pred, gt, mask)
+        else:
+            eps = _pred_channels(out)
+            loss_mse = masked_mse_loss(eps, noise, mask)
+            x0_pred = schedule.predict_x0_from_eps(x_t, t, eps)
         pred = _compose(mask, masked, x0_pred)
+
+        if use_x0_l1:
+            loss_x0_l1 = masked_l1_loss(pred, gt, mask, sample_weight=x0_l1_w)
+        else:
+            loss_x0_l1 = pred.new_zeros(())
 
         if use_ssim:
             loss_ssim = masked_ssim_loss(pred, gt, mask, sample_weight=ssim_w)
@@ -257,7 +242,12 @@ def train_one_epoch(
         else:
             loss_adv_g = pred.new_zeros(())
 
-        loss_g = loss_mse + ssim_weight * loss_ssim + adv_weight * loss_adv_g
+        loss_g = (
+            loss_mse
+            + x0_l1_weight * loss_x0_l1
+            + ssim_weight * loss_ssim
+            + adv_weight * loss_adv_g
+        )
         loss_g.backward()
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -279,6 +269,7 @@ def train_one_epoch(
             loss_d = pred.new_zeros(())
 
         sum_mse += loss_mse.item()
+        sum_x0_l1 += float(loss_x0_l1.item())
         sum_ssim += float(loss_ssim.item())
         sum_adv_g += float(loss_adv_g.item())
         sum_adv_d += float(loss_d.item())
@@ -286,6 +277,7 @@ def train_one_epoch(
         n_batches += 1
         pbar.set_postfix(
             mse=f"{loss_mse.item():.4f}",
+            x0_l1=f"{float(loss_x0_l1.item()):.4f}",
             ssim=f"{float(loss_ssim.item()):.4f}",
             adv_g=f"{float(loss_adv_g.item()):.4f}",
             adv_d=f"{float(loss_d.item()):.4f}",
@@ -294,6 +286,7 @@ def train_one_epoch(
     denom = max(1, n_batches)
     return {
         "train_mse": sum_mse / denom,
+        "train_x0_l1": sum_x0_l1 / denom,
         "train_ssim": sum_ssim / denom,
         "train_adv_g": sum_adv_g / denom,
         "train_adv_d": sum_adv_d / denom,
@@ -392,7 +385,16 @@ def train(args: argparse.Namespace) -> None:
         else os.path.join(args.output_dir, "train_val_loss_plot.png")
     )
 
-    val_fields = ["epoch", "val_loss", "psnr", "ssim", "ssim_masked", "fid"]
+    val_fields = [
+        "epoch",
+        "val_loss",
+        "psnr",
+        "psnr_masked",
+        "ssim",
+        "ssim_masked",
+        "fid",
+        "fid_masked",
+    ]
     loss_fields = ["epoch", "train_loss", "val_loss"]
 
     if main:
@@ -409,8 +411,7 @@ def train(args: argparse.Namespace) -> None:
         mask_size=args.mask_size,
         num_workers=args.num_workers,
         seed=args.seed,
-        subset_fraction=float(getattr(args, "subset_fraction", 1.0)),
-        max_samples=getattr(args, "max_samples", None),
+        subset_fraction=float(args.subset_fraction),
         distributed=distributed,
         rank=rank,
         world_size=world_size,
@@ -445,24 +446,34 @@ def train(args: argparse.Namespace) -> None:
         attn_drop=drop,
         proj_drop=drop,
         ffc_blocks=args.ffc_blocks,
+        stem_channels=args.stem_channels,
+        mid_channels=args.mid_channels,
+        mask_attn_bias=args.mask_attn_bias,
     ).to(device)
     disc = PatchDiscriminator(in_channels=1).to(device)
     adv_loss = AdversarialLoss(
-        real_label=float(getattr(args, "adv_real_label", 0.9)),
-        fake_label=float(getattr(args, "adv_fake_label", 0.1)),
+        real_label=float(args.adv_real_label),
+        fake_label=float(args.adv_fake_label),
     )
     schedule = DiffusionSchedule(num_timesteps=args.num_timesteps).to(device)
     image_metrics = ValImageMetrics().to(device) if main else None
-    sample_steps = int(getattr(args, "val_sample_steps", 50))
+    prediction = str(args.prediction).strip().lower()
+    if prediction not in ("x0", "eps"):
+        raise ValueError(f"prediction must be 'x0' or 'eps', got {prediction!r}")
+    infer_t = int(args.infer_t)
 
     n_params = sum(p.numel() for p in model.parameters())
     if main:
         write_log(
-            f"params={n_params / 1e6:.2f}M img_size={args.image_size} depth={args.depth} "
-            f"ffc_blocks={args.ffc_blocks} learn_sigma={int(args.learn_sigma)} "
-            f"val_sample_steps={sample_steps} adv_weight={args.adv_weight} "
+            f"params={n_params / 1e6:.2f}M img_size={args.image_size} patch_size={args.patch_size} "
+            f"depth={args.depth} ffc_blocks={args.ffc_blocks} "
+            f"stem_ch={args.stem_channels} mid_ch={args.mid_channels} "
+            f"mask_attn_bias={args.mask_attn_bias} learn_sigma={int(args.learn_sigma)} "
+            f"prediction={prediction} infer_t={infer_t} "
+            f"adv_weight={args.adv_weight} "
             f"adv_mse_threshold={args.adv_mse_threshold} ssim_weight={args.ssim_weight} "
             f"ssim_mse_threshold={args.ssim_mse_threshold} "
+            f"x0_l1_weight={args.x0_l1_weight} x0_l1_t_max_frac={args.x0_l1_t_max_frac} "
             f"dropout={drop} lr={args.lr}",
             log_path,
         )
@@ -488,7 +499,7 @@ def train(args: argparse.Namespace) -> None:
     )
     optimizer_d = torch.optim.AdamW(
         disc.parameters(),
-        lr=float(getattr(args, "d_lr", args.lr)),
+        lr=float(args.d_lr),
         weight_decay=args.weight_decay,
     )
     scheduler = build_warmup_cosine_scheduler(
@@ -562,9 +573,12 @@ def train(args: argparse.Namespace) -> None:
             adv_t_max_frac=args.adv_t_max_frac,
             ssim_weight=args.ssim_weight,
             ssim_t_max_frac=args.ssim_t_max_frac,
+            x0_l1_weight=args.x0_l1_weight,
+            x0_l1_t_max_frac=args.x0_l1_t_max_frac,
             use_adv=adv_unlocked,
             use_ssim=ssim_unlocked,
             sampler=samplers["train"],
+            prediction=prediction,
         )
 
         mean_train_mse = float(metrics["train_mse"])
@@ -603,7 +617,8 @@ def train(args: argparse.Namespace) -> None:
                 schedule,
                 device,
                 image_metrics=image_metrics,
-                sample_steps=sample_steps,
+                prediction=prediction,
+                infer_t=infer_t,
             )
             val_loss = float(val_metrics["val_loss"])
             metrics.update(val_metrics)
@@ -621,9 +636,11 @@ def train(args: argparse.Namespace) -> None:
                     "epoch": epoch,
                     "val_loss": f"{val_loss:.4f}",
                     "psnr": _fmt4("psnr", val_metrics),
+                    "psnr_masked": _fmt4("psnr_masked", val_metrics),
                     "ssim": _fmt4("ssim", val_metrics),
                     "ssim_masked": _fmt4("ssim_masked", val_metrics),
                     "fid": _fmt4("fid", val_metrics),
+                    "fid_masked": _fmt4("fid_masked", val_metrics),
                 },
                 val_fields,
             )
@@ -644,15 +661,20 @@ def train(args: argparse.Namespace) -> None:
             write_log(
                 f"epoch={epoch} train_loss={metrics['train_loss']:.6f} "
                 f"train_mse={metrics['train_mse']:.6f} "
+                f"train_x0_l1={metrics.get('train_x0_l1', 0.0):.6f} "
                 f"train_ssim={metrics.get('train_ssim', 0.0):.6f} "
                 f"train_adv_g={metrics.get('train_adv_g', 0.0):.6f} "
                 f"train_adv_d={metrics.get('train_adv_d', 0.0):.6f} "
                 f"ssim_unlocked={int(ssim_unlocked)} "
                 f"adv_unlocked={int(adv_unlocked)} "
-                f"val_loss={val_loss:.6f} psnr={val_metrics.get('psnr', float('nan')):.4f} "
+                f"val_loss={val_loss:.6f} "
+                f"psnr={val_metrics.get('psnr', float('nan')):.4f} "
+                f"psnr_masked={val_metrics.get('psnr_masked', float('nan')):.4f} "
                 f"ssim={val_metrics.get('ssim', float('nan')):.4f} "
                 f"ssim_masked={val_metrics.get('ssim_masked', float('nan')):.4f} "
-                f"fid={val_metrics.get('fid', float('nan')):.4f} lr={lr:.6e}",
+                f"fid={val_metrics.get('fid', float('nan')):.4f} "
+                f"fid_masked={val_metrics.get('fid_masked', float('nan')):.4f} "
+                f"lr={lr:.6e}",
                 log_path,
             )
 
@@ -669,8 +691,9 @@ def train(args: argparse.Namespace) -> None:
                     schedule=schedule,
                     device=device,
                     out_path=viz_path,
-                    sample_steps=sample_steps,
                     epoch=epoch,
+                    prediction=prediction,
+                    infer_t=infer_t,
                 )
                 write_log(
                     f"new best val_loss={best_val:.6f} -> {best_path}; viz -> {viz_path}",
@@ -725,16 +748,42 @@ def train(args: argparse.Namespace) -> None:
             schedule,
             device,
             image_metrics=image_metrics,
-            sample_steps=sample_steps,
+            prediction=prediction,
+            infer_t=infer_t,
         )
         write_log(
             f"test_loss={test_metrics['val_loss']:.6f} "
             f"test_psnr={test_metrics.get('psnr', float('nan')):.4f} "
+            f"test_psnr_masked={test_metrics.get('psnr_masked', float('nan')):.4f} "
             f"test_ssim={test_metrics.get('ssim', float('nan')):.4f} "
             f"test_ssim_masked={test_metrics.get('ssim_masked', float('nan')):.4f} "
             f"test_fid={test_metrics.get('fid', float('nan')):.4f} "
+            f"test_fid_masked={test_metrics.get('fid_masked', float('nan')):.4f} "
             f"best_val={best_val:.6f}",
             log_path,
+        )
+        append_csv_row(
+            os.path.join(args.output_dir, "test_metrics.csv"),
+            {
+                "psnr": f"{test_metrics.get('psnr', float('nan')):.4f}",
+                "psnr_masked": f"{test_metrics.get('psnr_masked', float('nan')):.4f}",
+                "ssim": f"{test_metrics.get('ssim', float('nan')):.4f}",
+                "ssim_masked": f"{test_metrics.get('ssim_masked', float('nan')):.4f}",
+                "fid": f"{test_metrics.get('fid', float('nan')):.4f}",
+                "fid_masked": f"{test_metrics.get('fid_masked', float('nan')):.4f}",
+                "test_loss": f"{test_metrics['val_loss']:.4f}",
+                "best_val": f"{best_val:.4f}",
+            },
+            [
+                "psnr",
+                "psnr_masked",
+                "ssim",
+                "ssim_masked",
+                "fid",
+                "fid_masked",
+                "test_loss",
+                "best_val",
+            ],
         )
 
     cleanup_distributed()
@@ -824,12 +873,31 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         help="Apply SSIM loss only for samples with t < frac * num_timesteps.",
     )
     p.add_argument(
-        "--val-sample-steps",
-        type=int,
-        default=d["val_sample_steps"],
-        help="Multi-step reverse steps for val/test image metrics and viz.",
+        "--x0-l1-weight",
+        type=float,
+        default=d["x0_l1_weight"],
+        help="Weight for masked x0 L1 loss on low-t predictions (0 disables).",
+    )
+    p.add_argument(
+        "--x0-l1-t-max-frac",
+        type=float,
+        default=d["x0_l1_t_max_frac"],
+        help="Apply x0 L1 only for samples with t < frac * num_timesteps.",
     )
     p.add_argument("--num-timesteps", type=int, default=d["num_timesteps"])
+    p.add_argument(
+        "--prediction",
+        type=str,
+        default=d["prediction"],
+        choices=("x0", "eps"),
+        help="Network target: direct x0 (one-step infer) or eps.",
+    )
+    p.add_argument(
+        "--infer-t",
+        type=int,
+        default=d["infer_t"],
+        help="Timestep for one-step infer/viz; <0 means T-1.",
+    )
     p.add_argument("--image-size", type=int, default=d["image_size"])
     p.add_argument("--mask-size", type=int, default=d["mask_size"])
     p.add_argument(
@@ -837,12 +905,6 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=d["subset_fraction"],
         help="Use this fraction of each split (0 < f <= 1).",
-    )
-    p.add_argument(
-        "--max-samples",
-        type=int,
-        default=d["max_samples"],
-        help="Optional hard cap on samples per split (overrides fraction when smaller).",
     )
     p.add_argument("--patch-size", type=int, default=d["patch_size"])
     p.add_argument("--hidden-size", type=int, default=d["hidden_size"])
@@ -853,8 +915,11 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--ffc-blocks",
         type=int,
         default=d["ffc_blocks"],
-        help="FFC blocks after DiT (local+global); 0 disables FFC.",
+        help="FFC blocks on mid features; 0 disables FFC.",
     )
+    p.add_argument("--stem-channels", type=int, default=d["stem_channels"])
+    p.add_argument("--mid-channels", type=int, default=d["mid_channels"])
+    p.add_argument("--mask-attn-bias", type=float, default=d["mask_attn_bias"])
     p.add_argument("--learn-sigma", action="store_true", default=d["learn_sigma"])
     p.add_argument("--no-learn-sigma", action="store_false", dest="learn_sigma")
     p.add_argument("--num-workers", type=int, default=d["num_workers"])

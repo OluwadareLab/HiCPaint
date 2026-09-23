@@ -41,13 +41,14 @@ def _crop_hole(
 
 
 class ValImageMetrics(nn.Module):
-    """Accumulates PSNR, SSIM, masked SSIM, and FID over a validation pass."""
+    """Accumulates PSNR/SSIM/FID (full + masked-hole) over a val/test/infer pass."""
 
     def __init__(self, data_range: float = 1.0):
         super().__init__()
         # Rank-0-only val must not all-reduce on compute (DDP is initialized).
         _sync = {"sync_on_compute": False}
         self.psnr = PeakSignalNoiseRatio(data_range=data_range, **_sync)
+        self.psnr_masked = PeakSignalNoiseRatio(data_range=data_range, **_sync)
         self.ssim = StructuralSimilarityIndexMeasure(data_range=data_range, **_sync)
         self.ssim_masked = StructuralSimilarityIndexMeasure(
             data_range=data_range, **_sync
@@ -55,12 +56,17 @@ class ValImageMetrics(nn.Module):
         self.fid = FrechetInceptionDistance(
             feature=2048, normalize=True, **_sync
         )
+        self.fid_masked = FrechetInceptionDistance(
+            feature=2048, normalize=True, **_sync
+        )
 
     def reset(self) -> None:
         self.psnr.reset()
+        self.psnr_masked.reset()
         self.ssim.reset()
         self.ssim_masked.reset()
         self.fid.reset()
+        self.fid_masked.reset()
 
     @torch.no_grad()
     def update(self, pred: torch.Tensor, gt: torch.Tensor, mask: torch.Tensor) -> None:
@@ -69,16 +75,22 @@ class ValImageMetrics(nn.Module):
         self.psnr.update(pred, gt)
         self.ssim.update(pred, gt)
         pred_hole, gt_hole = _crop_hole(pred, gt, mask)
+        self.psnr_masked.update(pred_hole, gt_hole)
         self.ssim_masked.update(pred_hole, gt_hole)
         real = _to_rgb01(gt)
         fake = _to_rgb01(pred)
         self.fid.update(real, real=True)
         self.fid.update(fake, real=False)
+        real_h = _to_rgb01(gt_hole)
+        fake_h = _to_rgb01(pred_hole)
+        self.fid_masked.update(real_h, real=True)
+        self.fid_masked.update(fake_h, real=False)
 
     @torch.no_grad()
     def compute(self) -> Dict[str, float]:
         out = {
             "psnr": float(self.psnr.compute().item()),
+            "psnr_masked": float(self.psnr_masked.compute().item()),
             "ssim": float(self.ssim.compute().item()),
             "ssim_masked": float(self.ssim_masked.compute().item()),
         }
@@ -86,4 +98,8 @@ class ValImageMetrics(nn.Module):
             out["fid"] = float(self.fid.compute().item())
         except Exception:
             out["fid"] = float("nan")
+        try:
+            out["fid_masked"] = float(self.fid_masked.compute().item())
+        except Exception:
+            out["fid_masked"] = float("nan")
         return out

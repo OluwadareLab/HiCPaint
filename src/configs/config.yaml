@@ -8,29 +8,19 @@ dir:
 
 file:
   dataset_dict: ./dataset/dataset_dict_5000_256
-  snapshot: ${dir.model_state}/${model.name}_snapshot.pt
   model: ${dir.model_state}/best_model.pt
   test_hic_map: ${dir.output}/inference
   num_visualization_samples: 2
   val_metrics: ${dir.output}/val_metrics.csv
-  psnr_val_plot: ${dir.output}/psnr_plot.png
-  ssim_val_plot: ${dir.output}/ssim_plot.png
-  ms_ssim_val_plot: ${dir.output}/ms_ssim_plot.png
   train_val_loss_plot: ${dir.output}/train_val_loss_plot.png
-  lr_plot: ${dir.output}/lr_plot.png
   log: ${dir.output}/train.log
 
 data:
-  patch: 256
-  resolution: 5000
-  batch_size: 16
+  batch_size: 10
   mask_size: 64
   num_workers: 4
   seed: 42
-  # Dataset size knob: fraction of each split (0 < f <= 1) and/or hard cap.
-  # Example: subset_fraction: 0.1  or  max_samples: 5000
   subset_fraction: 0.2
-  max_samples: null
 
 training:
   epochs: 50
@@ -41,7 +31,6 @@ training:
   warmup_epochs: 5
   grad_clip: 1.0
   patience: 0
-  # Curriculum: MSE-only → SSIM (mse<=ssim_mse_threshold) → adv (mse<=adv_mse_threshold)
   adv_weight: 0.1
   adv_mse_threshold: 0.4
   adv_t_max_frac: 0.5
@@ -51,35 +40,28 @@ training:
   ssim_weight: 0.1
   ssim_mse_threshold: 0.5
   ssim_t_max_frac: 0.5
-  val_sample_steps: 20
+  x0_l1_weight: 1.0
+  x0_l1_t_max_frac: 0.3
 
 model:
-  name: hicpaint_5000_256
   image_size: 256
-  patch_size: 16
+  patch_size: 8
   hidden_size: 768
   depth: 8
   num_heads: 8
   dropout: 0.0
   ffc_blocks: 4
+  stem_channels: 64
+  mid_channels: 64
+  mask_attn_bias: 4.0
+  prediction: x0
+  infer_t: -1
   learn_sigma: false
   num_timesteps: 1000
 
 inference:
-  batch_size: 4
-  num_samples: 8
-  sample_steps: 50
-
-loss:
-  weight_parameters:
-    - name: mse
-      boundaries: [0]
-      values: [1.0]
-
-evaluation:
-  monitor: loss
-  metrics:
-    psnr: true
-    ssim: true
-    ssim_masked: true
-    fid: true
+  split: val
+  batch_size: 10
+  num_samples: 0
+  save_npy: true
+  viz_name: inference_grid.png

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, get_args, get_origin, get_type_hints
+from typing import Any, Dict, Union, get_args, get_origin, get_type_hints
 
 from omegaconf import OmegaConf
 
@@ -20,31 +20,21 @@ class DirConfig:
 @dataclass
 class FileConfig:
     dataset_dict: str
-    snapshot: str
     model: str
     test_hic_map: str
     val_metrics: str
     num_visualization_samples: int
-    psnr_val_plot: str
-    ssim_val_plot: str
-    ms_ssim_val_plot: str
     train_val_loss_plot: str
-    lr_plot: str
     log: str
 
 
 @dataclass
 class DataConfig:
-    patch: int
-    resolution: int
     batch_size: int
     mask_size: int = 64
     num_workers: int = 4
     seed: int = 42
-    # Use a fraction of each split (0 < f <= 1). Combined with max_samples if set.
     subset_fraction: float = 1.0
-    # Optional hard cap on samples per split; null/omit = no cap.
-    max_samples: Optional[int] = None
 
 
 @dataclass
@@ -66,61 +56,35 @@ class TrainingConfig:
     ssim_weight: float = 0.1
     ssim_mse_threshold: float = 0.5
     ssim_t_max_frac: float = 0.5
-    val_sample_steps: int = 20
-
-
-@dataclass
-class FlowConfig:
-    num_of_convs: List[int]
-    out_channels: List[int]
+    x0_l1_weight: float = 1.0
+    x0_l1_t_max_frac: float = 0.3
 
 
 @dataclass
 class ModelConfig:
-    name: str
     image_size: int = 256
-    patch_size: int = 16
+    patch_size: int = 8
     hidden_size: int = 768
     depth: int = 8
     num_heads: int = 8
     dropout: float = 0.0
     ffc_blocks: int = 4
+    stem_channels: int = 64
+    mid_channels: int = 64
+    mask_attn_bias: float = 4.0
+    prediction: str = "x0"
+    infer_t: int = -1
     learn_sigma: bool = False
     num_timesteps: int = 1000
 
 
 @dataclass
 class InferenceConfig:
+    split: str = "val"
     batch_size: int = 4
-    num_samples: int = 8
-    sample_steps: int = 50
-
-
-@dataclass
-class LossWeightConfig:
-    name: str
-    boundaries: List[int]
-    values: List[float]
-
-
-@dataclass
-class LossConfig:
-    weight_parameters: List[LossWeightConfig]
-
-
-@dataclass
-class EvalMetricConfig:
-    psnr: bool = True
-    ssim: bool = True
-    ssim_masked: bool = True
-    fid: bool = True
-    hicrep: bool = False
-
-
-@dataclass
-class EvaluationConfig:
-    monitor: str = "loss"
-    metrics: EvalMetricConfig = field(default_factory=EvalMetricConfig)
+    num_samples: int = 0
+    save_npy: bool = True
+    viz_name: str = "inference_grid.png"
 
 
 @dataclass
@@ -131,9 +95,7 @@ class Config:
     data: DataConfig
     training: TrainingConfig
     model: ModelConfig
-    loss: LossConfig
-    evaluation: EvaluationConfig = field(default_factory=EvaluationConfig)
-    inference: InferenceConfig = field(default_factory=InferenceConfig)
+    inference: InferenceConfig
 
 
 def _from_dict(cls: type, data: Any) -> Any:
@@ -209,18 +171,23 @@ def config_to_train_defaults(cfg: Config) -> Dict[str, Any]:
         "ssim_weight": cfg.training.ssim_weight,
         "ssim_mse_threshold": cfg.training.ssim_mse_threshold,
         "ssim_t_max_frac": cfg.training.ssim_t_max_frac,
-        "val_sample_steps": cfg.training.val_sample_steps,
+        "x0_l1_weight": cfg.training.x0_l1_weight,
+        "x0_l1_t_max_frac": cfg.training.x0_l1_t_max_frac,
         "num_timesteps": cfg.model.num_timesteps,
         "image_size": cfg.model.image_size,
         "mask_size": cfg.data.mask_size,
         "subset_fraction": cfg.data.subset_fraction,
-        "max_samples": cfg.data.max_samples,
         "patch_size": cfg.model.patch_size,
         "hidden_size": cfg.model.hidden_size,
         "depth": cfg.model.depth,
         "num_heads": cfg.model.num_heads,
         "dropout": cfg.model.dropout,
         "ffc_blocks": cfg.model.ffc_blocks,
+        "stem_channels": cfg.model.stem_channels,
+        "mid_channels": cfg.model.mid_channels,
+        "mask_attn_bias": cfg.model.mask_attn_bias,
+        "prediction": cfg.model.prediction,
+        "infer_t": cfg.model.infer_t,
         "learn_sigma": cfg.model.learn_sigma,
         "num_workers": cfg.data.num_workers,
         "seed": cfg.data.seed,
@@ -229,9 +196,13 @@ def config_to_train_defaults(cfg: Config) -> Dict[str, Any]:
 
 def config_to_test_defaults(cfg: Config) -> Dict[str, Any]:
     """Flat argparse defaults for ``test_lib.parse_args``."""
+    split = str(cfg.inference.split).strip().lower()
+    if split not in ("train", "val", "test"):
+        raise ValueError(f"inference.split must be train|val|test, got {split!r}")
     return {
         "checkpoint": cfg.file.model,
-        "record_file": f"{cfg.file.dataset_dict}.test",
+        "dataset_dict": cfg.file.dataset_dict,
+        "record_file": f"{cfg.file.dataset_dict}.{split}",
         "img_dir": cfg.dir.image,
         "output_dir": cfg.file.test_hic_map,
         "device": cfg.device,
@@ -239,13 +210,21 @@ def config_to_test_defaults(cfg: Config) -> Dict[str, Any]:
         "num_samples": cfg.inference.num_samples,
         "seed": cfg.data.seed,
         "mask_size": cfg.data.mask_size,
+        "subset_fraction": cfg.data.subset_fraction,
         "image_size": cfg.model.image_size,
         "patch_size": cfg.model.patch_size,
         "hidden_size": cfg.model.hidden_size,
         "depth": cfg.model.depth,
         "num_heads": cfg.model.num_heads,
         "ffc_blocks": cfg.model.ffc_blocks,
+        "stem_channels": cfg.model.stem_channels,
+        "mid_channels": cfg.model.mid_channels,
+        "mask_attn_bias": cfg.model.mask_attn_bias,
         "num_timesteps": cfg.model.num_timesteps,
-        "sample_steps": cfg.inference.sample_steps,
+        "prediction": cfg.model.prediction,
+        "infer_t": cfg.model.infer_t,
         "learn_sigma": cfg.model.learn_sigma,
+        "save_npy": cfg.inference.save_npy,
+        "viz_name": cfg.inference.viz_name,
+        "split": split,
     }

@@ -21,6 +21,28 @@ def masked_mse_loss(
     return diff.sum() / denom
 
 
+def masked_l1_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """L1 averaged only over hole pixels where ``mask == 1``.
+
+    Optional ``sample_weight`` ``(B,)`` gates per sample (e.g. low-``t`` only).
+    """
+    err = (pred - target).abs() * mask
+    if sample_weight is None:
+        return err.sum() / mask.sum().clamp_min(1.0)
+    w = sample_weight.to(dtype=err.dtype)
+    if float(w.sum().detach().item()) <= 0.0:
+        return pred.new_zeros(())
+    w_b = w.reshape(-1, *([1] * (err.ndim - 1)))
+    per_sample_hole = mask.reshape(mask.shape[0], -1).sum(dim=1).clamp_min(1.0)
+    denom = (per_sample_hole * w).sum().clamp_min(1.0)
+    return (err * w_b).sum() / denom
+
+
 def _ssim_1ch(
     pred: torch.Tensor,
     target: torch.Tensor,
