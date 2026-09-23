@@ -1,11 +1,33 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
+
+
+def masked_selection_score(
+    metrics: Dict[str, float],
+    w_psnr: float = 1.0,
+    w_ssim: float = 100.0,
+    w_fid: float = 1.0,
+) -> float:
+    """Higher is better: ``w_psnr*PSNR + w_ssim*SSIM - w_fid*FID`` on masked hole.
+
+    FID may be NaN early (too few samples); then score uses PSNR+SSIM only.
+    """
+    psnr = float(metrics.get("psnr_masked", float("nan")))
+    ssim = float(metrics.get("ssim_masked", float("nan")))
+    fid = float(metrics.get("fid_masked", float("nan")))
+    if not math.isfinite(psnr) or not math.isfinite(ssim):
+        return float("-inf")
+    score = w_psnr * psnr + w_ssim * ssim
+    if math.isfinite(fid):
+        score -= w_fid * fid
+    return score
 
 
 def _to_rgb01(x: torch.Tensor) -> torch.Tensor:

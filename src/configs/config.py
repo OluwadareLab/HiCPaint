@@ -58,6 +58,9 @@ class TrainingConfig:
     ssim_t_max_frac: float = 0.5
     x0_l1_weight: float = 1.0
     x0_l1_t_max_frac: float = 0.3
+    best_psnr_weight: float = 1.0
+    best_ssim_weight: float = 100.0
+    best_fid_weight: float = 1.0
 
 
 @dataclass
@@ -83,7 +86,8 @@ class InferenceConfig:
     split: str = "val"
     batch_size: int = 4
     num_samples: int = 0
-    save_npy: bool = True
+    save_npy: bool = False
+    viz_per_chromosome: int = 2
     viz_name: str = "inference_grid.png"
 
 
@@ -173,6 +177,9 @@ def config_to_train_defaults(cfg: Config) -> Dict[str, Any]:
         "ssim_t_max_frac": cfg.training.ssim_t_max_frac,
         "x0_l1_weight": cfg.training.x0_l1_weight,
         "x0_l1_t_max_frac": cfg.training.x0_l1_t_max_frac,
+        "best_psnr_weight": cfg.training.best_psnr_weight,
+        "best_ssim_weight": cfg.training.best_ssim_weight,
+        "best_fid_weight": cfg.training.best_fid_weight,
         "num_timesteps": cfg.model.num_timesteps,
         "image_size": cfg.model.image_size,
         "mask_size": cfg.data.mask_size,
@@ -225,6 +232,7 @@ def config_to_test_defaults(cfg: Config) -> Dict[str, Any]:
         "infer_t": cfg.model.infer_t,
         "learn_sigma": cfg.model.learn_sigma,
         "save_npy": cfg.inference.save_npy,
+        "viz_per_chromosome": cfg.inference.viz_per_chromosome,
         "viz_name": cfg.inference.viz_name,
         "split": split,
     }

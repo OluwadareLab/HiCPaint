@@ -14,7 +14,7 @@ from tqdm import tqdm
 from src.configs import DEFAULT_CONFIG_PATH, config_to_train_defaults, load_config
 from src.data_loader.load_data import CustomDataset, ImageDataset
 from src.loss import AdversarialLoss, masked_l1_loss, masked_mse_loss, masked_ssim_loss
-from src.metric import ValImageMetrics
+from src.metric import ValImageMetrics, masked_selection_score
 from src.model import DiffusionTransformer, PatchDiscriminator
 from src.utils import (
     DiffusionSchedule,
@@ -302,7 +302,7 @@ def save_checkpoint(
     optimizer_d: torch.optim.Optimizer,
     scheduler: Any,
     epoch: int,
-    best_val: float,
+    best_score: float,
     metrics: Optional[Dict[str, float]] = None,
     adv_unlocked: bool = False,
     ssim_unlocked: bool = False,
@@ -314,7 +314,8 @@ def save_checkpoint(
     torch.save(
         {
             "epoch": epoch,
-            "best_val": best_val,
+            "best_score": best_score,
+            "best_val": best_score,  # alias for older resume paths
             "adv_unlocked": bool(adv_unlocked),
             "ssim_unlocked": bool(ssim_unlocked),
             "model": unwrap_model(model).state_dict(),
@@ -329,15 +330,26 @@ def save_checkpoint(
     )
 
 
-def save_best_weights(path: str, model: nn.Module, epoch: int, val_loss: float) -> None:
-    """Save best DiT weights only (criteria: lowest val loss)."""
+def save_best_weights(
+    path: str,
+    model: nn.Module,
+    epoch: int,
+    score: float,
+    metrics: Optional[Dict[str, float]] = None,
+) -> None:
+    """Save best DiT weights (criteria: masked PSNR/SSIM/FID selection score)."""
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
+    m = metrics or {}
     torch.save(
         {
             "epoch": epoch,
-            "val_loss": val_loss,
+            "best_score": score,
+            "val_loss": float(m.get("val_loss", float("nan"))),
+            "psnr_masked": float(m.get("psnr_masked", float("nan"))),
+            "ssim_masked": float(m.get("ssim_masked", float("nan"))),
+            "fid_masked": float(m.get("fid_masked", float("nan"))),
             "model": unwrap_model(model).state_dict(),
         },
         path,
@@ -474,6 +486,8 @@ def train(args: argparse.Namespace) -> None:
             f"adv_mse_threshold={args.adv_mse_threshold} ssim_weight={args.ssim_weight} "
             f"ssim_mse_threshold={args.ssim_mse_threshold} "
             f"x0_l1_weight={args.x0_l1_weight} x0_l1_t_max_frac={args.x0_l1_t_max_frac} "
+            f"best_score=w_psnr*{args.best_psnr_weight}+w_ssim*{args.best_ssim_weight}"
+            f"-w_fid*{args.best_fid_weight} "
             f"dropout={drop} lr={args.lr}",
             log_path,
         )
@@ -511,7 +525,7 @@ def train(args: argparse.Namespace) -> None:
     )
 
     start_epoch = 1
-    best_val = float("inf")
+    best_score = float("-inf")
     epochs_no_improve = 0
     ssim_unlocked = False
     adv_unlocked = False
@@ -532,13 +546,17 @@ def train(args: argparse.Namespace) -> None:
         if ckpt.get("scheduler") is not None:
             scheduler.load_state_dict(ckpt["scheduler"])
         start_epoch = int(ckpt.get("epoch", 0)) + 1
-        best_val = float(ckpt.get("best_val", best_val))
+        if "best_score" in ckpt:
+            best_score = float(ckpt["best_score"])
+        elif "best_val" in ckpt:
+            # Older ckpts stored min val_loss; force re-compete on masked score.
+            best_score = float("-inf")
         ssim_unlocked = bool(ckpt.get("ssim_unlocked", False))
         adv_unlocked = bool(ckpt.get("adv_unlocked", False))
         if main:
             write_log(
                 f"resumed from {args.resume} epoch={start_epoch - 1} "
-                f"best_val={best_val:.6f} ssim_unlocked={ssim_unlocked} "
+                f"best_score={best_score:.6f} ssim_unlocked={ssim_unlocked} "
                 f"adv_unlocked={adv_unlocked}",
                 log_path,
             )
@@ -624,6 +642,13 @@ def train(args: argparse.Namespace) -> None:
             metrics.update(val_metrics)
             lr = optimizer_g.param_groups[0]["lr"]
             metrics["lr"] = lr
+            sel_score = masked_selection_score(
+                val_metrics,
+                w_psnr=float(args.best_psnr_weight),
+                w_ssim=float(args.best_ssim_weight),
+                w_fid=float(args.best_fid_weight),
+            )
+            metrics["sel_score"] = sel_score
 
             def _fmt4(key: str, src: Dict[str, float]) -> str:
                 if key not in src:
@@ -674,15 +699,16 @@ def train(args: argparse.Namespace) -> None:
                 f"ssim_masked={val_metrics.get('ssim_masked', float('nan')):.4f} "
                 f"fid={val_metrics.get('fid', float('nan')):.4f} "
                 f"fid_masked={val_metrics.get('fid_masked', float('nan')):.4f} "
+                f"sel_score={sel_score:.4f} "
                 f"lr={lr:.6e}",
                 log_path,
             )
 
-            improved = val_loss < best_val
+            improved = sel_score > best_score
             if improved:
-                best_val = val_loss
+                best_score = sel_score
                 epochs_no_improve = 0
-                save_best_weights(best_path, model, epoch, val_loss)
+                save_best_weights(best_path, model, epoch, best_score, val_metrics)
                 viz_path = os.path.join(viz_dir, f"best_epoch_{epoch:04d}.png")
                 visualize_gt_masked_pred(
                     model=unwrap_model(model),
@@ -696,7 +722,11 @@ def train(args: argparse.Namespace) -> None:
                     infer_t=infer_t,
                 )
                 write_log(
-                    f"new best val_loss={best_val:.6f} -> {best_path}; viz -> {viz_path}",
+                    f"new best sel_score={best_score:.6f} "
+                    f"(psnr_m={val_metrics.get('psnr_masked', float('nan')):.4f} "
+                    f"ssim_m={val_metrics.get('ssim_masked', float('nan')):.4f} "
+                    f"fid_m={val_metrics.get('fid_masked', float('nan')):.4f}) "
+                    f"-> {best_path}; viz -> {viz_path}",
                     log_path,
                 )
             else:
@@ -711,7 +741,7 @@ def train(args: argparse.Namespace) -> None:
                     optimizer_d,
                     scheduler,
                     epoch,
-                    best_val,
+                    best_score,
                     metrics,
                     adv_unlocked=adv_unlocked,
                     ssim_unlocked=ssim_unlocked,
@@ -759,7 +789,7 @@ def train(args: argparse.Namespace) -> None:
             f"test_ssim_masked={test_metrics.get('ssim_masked', float('nan')):.4f} "
             f"test_fid={test_metrics.get('fid', float('nan')):.4f} "
             f"test_fid_masked={test_metrics.get('fid_masked', float('nan')):.4f} "
-            f"best_val={best_val:.6f}",
+            f"best_score={best_score:.6f}",
             log_path,
         )
         append_csv_row(
@@ -772,7 +802,7 @@ def train(args: argparse.Namespace) -> None:
                 "fid": f"{test_metrics.get('fid', float('nan')):.4f}",
                 "fid_masked": f"{test_metrics.get('fid_masked', float('nan')):.4f}",
                 "test_loss": f"{test_metrics['val_loss']:.4f}",
-                "best_val": f"{best_val:.4f}",
+                "best_score": f"{best_score:.4f}",
             },
             [
                 "psnr",
@@ -782,7 +812,7 @@ def train(args: argparse.Namespace) -> None:
                 "fid",
                 "fid_masked",
                 "test_loss",
-                "best_val",
+                "best_score",
             ],
         )
 
@@ -883,6 +913,24 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=d["x0_l1_t_max_frac"],
         help="Apply x0 L1 only for samples with t < frac * num_timesteps.",
+    )
+    p.add_argument(
+        "--best-psnr-weight",
+        type=float,
+        default=d["best_psnr_weight"],
+        help="Weight for psnr_masked in best-model selection score.",
+    )
+    p.add_argument(
+        "--best-ssim-weight",
+        type=float,
+        default=d["best_ssim_weight"],
+        help="Weight for ssim_masked in best-model selection score.",
+    )
+    p.add_argument(
+        "--best-fid-weight",
+        type=float,
+        default=d["best_fid_weight"],
+        help="Weight for fid_masked in best-model selection score (subtracted).",
     )
     p.add_argument("--num-timesteps", type=int, default=d["num_timesteps"])
     p.add_argument(

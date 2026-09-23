@@ -42,6 +42,10 @@ training:
   ssim_t_max_frac: 0.5
   x0_l1_weight: 1.0
   x0_l1_t_max_frac: 0.3
+  # Best checkpoint: maximize w_psnr*psnr_masked + w_ssim*ssim_masked - w_fid*fid_masked
+  best_psnr_weight: 1.0
+  best_ssim_weight: 100.0
+  best_fid_weight: 1.0
 
 model:
   image_size: 256
@@ -63,5 +67,6 @@ inference:
   split: val
   batch_size: 10
   num_samples: 0
-  save_npy: true
+  save_npy: false
+  viz_per_chromosome: 2
   viz_name: inference_grid.png
