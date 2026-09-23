@@ -174,6 +174,13 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> DiffusionTransformer:
+    ckpt = torch.load(args.checkpoint, map_location=device)
+    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+    # LabelEmbedder is num_classes + 1 when trained with class_dropout_prob > 0.
+    num_classes = 1
+    y_key = "y_embedder.embedding_table.weight"
+    y_rows = int(state[y_key].shape[0]) if y_key in state else num_classes
+    class_dropout_prob = 0.1 if y_rows > num_classes else 0.0
     model = DiffusionTransformer(
         img_size=args.image_size,
         patch_size=args.patch_size,
@@ -181,16 +188,14 @@ def load_model(args: argparse.Namespace, device: torch.device) -> DiffusionTrans
         hidden_size=args.hidden_size,
         depth=args.depth,
         num_heads=args.num_heads,
-        class_dropout_prob=0.0,
-        num_classes=1,
+        class_dropout_prob=class_dropout_prob,
+        num_classes=num_classes,
         learn_sigma=args.learn_sigma,
         ffc_blocks=args.ffc_blocks,
         stem_channels=args.stem_channels,
         mid_channels=args.mid_channels,
         mask_attn_bias=args.mask_attn_bias,
     ).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
     model.load_state_dict(state)
     model.eval()
     return model
