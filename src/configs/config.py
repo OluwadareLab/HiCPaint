@@ -68,9 +68,9 @@ class ModelConfig:
     image_size: int = 256
     patch_size: int = 8
     hidden_size: int = 768
-    depth: int = 8
+    depth: int = 12
     num_heads: int = 8
-    dropout: float = 0.0
+    dropout: float = 0.1
     ffc_blocks: int = 4
     stem_channels: int = 64
     mid_channels: int = 64

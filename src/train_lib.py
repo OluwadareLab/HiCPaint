@@ -407,7 +407,7 @@ def train(args: argparse.Namespace) -> None:
         "fid",
         "fid_masked",
     ]
-    loss_fields = ["epoch", "train_loss", "val_loss"]
+    loss_fields = ["epoch", "train_mse", "val_mse"]
 
     if main:
         write_log(
@@ -673,13 +673,13 @@ def train(args: argparse.Namespace) -> None:
                 loss_csv,
                 {
                     "epoch": epoch,
-                    "train_loss": f"{float(metrics['train_loss']):.4f}",
-                    "val_loss": f"{val_loss:.4f}",
+                    "train_mse": f"{float(metrics['train_mse']):.4f}",
+                    "val_mse": f"{val_loss:.4f}",
                 },
                 loss_fields,
             )
             hist_epochs.append(epoch)
-            hist_train.append(float(metrics["train_loss"]))
+            hist_train.append(float(metrics["train_mse"]))
             hist_val.append(val_loss)
             plot_train_val_loss(hist_epochs, hist_train, hist_val, loss_plot)
 

@@ -16,11 +16,11 @@ file:
   log: ${dir.output}/train.log
 
 data:
-  batch_size: 10
+  batch_size: 6
   mask_size: 64
   num_workers: 4
   seed: 42
-  subset_fraction: 0.2
+  subset_fraction: 1.0
 
 training:
   epochs: 50
@@ -51,9 +51,9 @@ model:
   image_size: 256
   patch_size: 8
   hidden_size: 768
-  depth: 8
+  depth: 12
   num_heads: 8
-  dropout: 0.0
+  dropout: 0.2
   ffc_blocks: 4
   stem_channels: 64
   mid_channels: 64
@@ -65,7 +65,7 @@ model:
 
 inference:
   split: val
-  batch_size: 10
+  batch_size: 8
   num_samples: 0
   save_npy: false
   viz_per_chromosome: 2

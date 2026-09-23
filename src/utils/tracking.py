@@ -30,16 +30,16 @@ def plot_train_val_loss(
     val_losses: Sequence[float],
     out_path: str,
 ) -> None:
-    """Draw and save a train vs val loss curve."""
+    """Draw and save train vs val masked-MSE curves (same metric)."""
     parent = os.path.dirname(out_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.plot(list(epochs), list(train_losses), label="train_loss", linewidth=2)
-    ax.plot(list(epochs), list(val_losses), label="val_loss", linewidth=2)
+    ax.plot(list(epochs), list(train_losses), label="train_mse", linewidth=2)
+    ax.plot(list(epochs), list(val_losses), label="val_mse", linewidth=2)
     ax.set_xlabel("epoch")
-    ax.set_ylabel("loss")
-    ax.set_title("Train vs Val Loss")
+    ax.set_ylabel("masked MSE")
+    ax.set_title("Train vs Val Masked MSE")
     ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
