@@ -16,7 +16,7 @@ file:
   log: ${dir.output}/train.log
 
 data:
-  batch_size: 6
+  batch_size: 8
   mask_size: 64
   num_workers: 4
   seed: 42
@@ -51,7 +51,7 @@ model:
   image_size: 256
   patch_size: 8
   hidden_size: 768
-  depth: 12
+  depth: 8
   num_heads: 8
   dropout: 0.2
   ffc_blocks: 4

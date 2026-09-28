@@ -48,7 +48,8 @@ graphify-out/
 .ipynb_checkpoints/
 
 # Local notes / scratch
-explain.md
+!README.md
 *.log
 *.csv
+*.md
 !requirements.txt
