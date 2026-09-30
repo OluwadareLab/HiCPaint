@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .attention import BidirectionalSelfAttention
+from .attention import BidirectionalSelfAttention, CrossAttention
 from .mlp import Mlp
 
 
@@ -53,6 +53,112 @@ class DiTBlock(nn.Module):
         )
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa),
+            attn_bias=attn_bias,
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class DiTCrossBlock(nn.Module):
+    """adaLN-Zero block: queries from ``x``, keys/values from ``context``."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_ctx = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = CrossAttention(
+            hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden,
+            act_layer=nn.GELU,
+            drop=proj_drop,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        c: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            self.norm_ctx(context),
+            attn_bias=attn_bias,
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+
+
+class DiTCrossBlock(nn.Module):
+    """adaLN-Zero block: queries from ``x``, keys/values from ``context``."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0,
+    ):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm_ctx = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = CrossAttention(
+            hidden_size,
+            num_heads=num_heads,
+            qkv_bias=True,
+            attn_drop=attn_drop,
+            proj_drop=proj_drop,
+        )
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden = int(hidden_size * mlp_ratio)
+        self.mlp = Mlp(
+            in_features=hidden_size,
+            hidden_features=mlp_hidden,
+            act_layer=nn.GELU,
+            drop=proj_drop,
+        )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True),
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        c: torch.Tensor,
+        attn_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=1)
+        )
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), shift_msa, scale_msa),
+            self.norm_ctx(context),
             attn_bias=attn_bias,
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))

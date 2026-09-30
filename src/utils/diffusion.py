@@ -144,6 +144,7 @@ class DiffusionSchedule(nn.Module):
         y: torch.Tensor | None = None,
         t_value: int = -1,
         prediction: str = "x0",
+        structure: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Single-pass blind inpaint: noise in hole → predict clean ``x0`` → compose.
 
@@ -161,7 +162,7 @@ class DiffusionSchedule(nn.Module):
 
         x = (1.0 - mask) * masked + mask * torch.randn_like(masked)
         t = torch.full((b,), tv, device=device, dtype=torch.long)
-        out = model(torch.cat([x, mask, masked], dim=1), t, y)
+        out = model(torch.cat([x, mask, masked], dim=1), t, y, structure=structure)
         if prediction == "x0":
             x0 = out[:, :1]
         elif prediction == "eps":
@@ -180,6 +181,7 @@ class DiffusionSchedule(nn.Module):
         num_steps: int | None = None,
         eta: float = 0.0,
         prediction: str = "eps",
+        structure: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Multi-step blind inpainting (DDPM/DDIM). Prefer ``inpaint_onestep`` for x0.
 
@@ -209,7 +211,7 @@ class DiffusionSchedule(nn.Module):
         for i, t_int in enumerate(times):
             t = torch.full((b,), int(t_int), device=device, dtype=torch.long)
             model_in = torch.cat([x, mask, masked], dim=1)
-            out = model(model_in, t, y)
+            out = model(model_in, t, y, structure=structure)
             if prediction == "x0":
                 x0 = out[:, :1]
                 eps = self.predict_eps_from_x0(x, t, x0)

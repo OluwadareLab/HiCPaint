@@ -12,13 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
-KEYS = ("gt", "mask", "masked", "edge", "line")
+KEYS = ("gt", "mask", "masked", "edge", "line", "dot")
 CMAPS = {
     "gt": "Reds",
     "mask": "gray",
     "masked": "Reds",
     "edge": "gray",
     "line": "gray",
+    "dot": "gray",
 }
 
 

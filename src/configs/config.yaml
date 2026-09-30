@@ -16,7 +16,7 @@ file:
   log: ${dir.output}/train.log
 
 data:
-  batch_size: 8
+  batch_size: 4
   mask_size: 64
   num_workers: 4
   seed: 42
@@ -42,9 +42,9 @@ training:
   ssim_t_max_frac: 0.5
   x0_l1_weight: 1.0
   x0_l1_t_max_frac: 0.3
-  # Best checkpoint: maximize w_psnr*psnr_masked + w_ssim*ssim_masked - w_fid*fid_masked
+  # Best checkpoint: maximize w*(PSNR/20) + w*(SSIM/1) - w*(FID/100); weights=1 → equal vote
   best_psnr_weight: 1.0
-  best_ssim_weight: 100.0
+  best_ssim_weight: 1.0
   best_fid_weight: 1.0
 
 model:
@@ -65,7 +65,7 @@ model:
 
 inference:
   split: val
-  batch_size: 8
+  batch_size: 4
   num_samples: 0
   save_npy: false
   viz_per_chromosome: 2

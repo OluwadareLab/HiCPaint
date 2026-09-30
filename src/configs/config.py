@@ -59,7 +59,7 @@ class TrainingConfig:
     x0_l1_weight: float = 1.0
     x0_l1_t_max_frac: float = 0.3
     best_psnr_weight: float = 1.0
-    best_ssim_weight: float = 100.0
+    best_ssim_weight: float = 1.0
     best_fid_weight: float = 1.0
 
 

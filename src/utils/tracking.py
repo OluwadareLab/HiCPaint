@@ -83,9 +83,23 @@ def visualize_gt_masked_pred(
         gt = sample["gt"].unsqueeze(0).to(device)
         mask = sample["mask"].unsqueeze(0).to(device)
         masked = sample["masked"].unsqueeze(0).to(device)
+        structure = torch.cat(
+            [
+                sample["edge"].unsqueeze(0).to(device),
+                sample["line"].unsqueeze(0).to(device),
+                sample["dot"].unsqueeze(0).to(device),
+            ],
+            dim=1,
+        )
         y = torch.zeros(1, dtype=torch.long, device=device)
         pred = schedule.inpaint_onestep(
-            model, mask, masked, y=y, t_value=infer_t, prediction=prediction
+            model,
+            mask,
+            masked,
+            y=y,
+            t_value=infer_t,
+            prediction=prediction,
+            structure=structure,
         )
 
         panels = [

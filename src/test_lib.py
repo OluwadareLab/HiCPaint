@@ -352,6 +352,14 @@ def run_inference(args: argparse.Namespace) -> None:
         mask = sample["mask"].unsqueeze(0).to(device)
         masked = sample["masked"].unsqueeze(0).to(device)
         gt = sample["gt"].unsqueeze(0).to(device)
+        structure = torch.cat(
+            [
+                sample["edge"].unsqueeze(0).to(device),
+                sample["line"].unsqueeze(0).to(device),
+                sample["dot"].unsqueeze(0).to(device),
+            ],
+            dim=1,
+        )
         dataset, chrom = _labels_from_path(ds.image_paths[idx])
         key = (dataset, chrom)
 
@@ -361,6 +369,7 @@ def run_inference(args: argparse.Namespace) -> None:
             masked=masked,
             t_value=infer_t,
             prediction=prediction,
+            structure=structure,
         )
         overall_metrics.update(pred, gt, mask)
         if key in group_metrics:

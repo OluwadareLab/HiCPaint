@@ -9,24 +9,33 @@ from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMe
 from torchmetrics.image.fid import FrechetInceptionDistance
 
 
+# Typical metric scales so equal weights ≈ equal vote after normalization.
+_PSNR_SCALE = 20.0
+_SSIM_SCALE = 1.0
+_FID_SCALE = 100.0
+
+
 def masked_selection_score(
     metrics: Dict[str, float],
     w_psnr: float = 1.0,
-    w_ssim: float = 100.0,
+    w_ssim: float = 1.0,
     w_fid: float = 1.0,
 ) -> float:
-    """Higher is better: ``w_psnr*PSNR + w_ssim*SSIM - w_fid*FID`` on masked hole.
+    """Higher is better on masked hole (scale-normalized):
 
-    FID may be NaN early (too few samples); then score uses PSNR+SSIM only.
+    ``w_psnr*(PSNR/20) + w_ssim*(SSIM/1) - w_fid*(FID/100)``
+
+    Default weights=1 → equal contribution at typical ranges. FID may be NaN
+    early (too few samples); then score uses PSNR+SSIM only.
     """
     psnr = float(metrics.get("psnr_masked", float("nan")))
     ssim = float(metrics.get("ssim_masked", float("nan")))
     fid = float(metrics.get("fid_masked", float("nan")))
     if not math.isfinite(psnr) or not math.isfinite(ssim):
         return float("-inf")
-    score = w_psnr * psnr + w_ssim * ssim
+    score = w_psnr * (psnr / _PSNR_SCALE) + w_ssim * (ssim / _SSIM_SCALE)
     if math.isfinite(fid):
-        score -= w_fid * fid
+        score -= w_fid * (fid / _FID_SCALE)
     return score
 
 

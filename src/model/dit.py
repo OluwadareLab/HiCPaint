@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .blocks import DiTBlock, FinalLayer
+from .blocks import DiTBlock, DiTCrossBlock, FinalLayer
 from .embeddings import LabelEmbedder, PatchEmbed, TimestepEmbedder
 from .ffc import FFCBlock
 from .hybrid import ConvDecoder, ConvStem, HoleRefine
@@ -39,9 +39,10 @@ def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nd
 
 
 class DiffusionTransformer(nn.Module):
-    """Blind-inpaint DiT: CNN stem → split cond tokens → mask-aware DiT → FFC → hole refine.
+    """Blind-inpaint DiT: CNN stem → DiT ↔ structure DiT (cross-attn) → FFC → hole refine.
 
-    Input is still stacked ``[x_t, mask, masked]`` (3 channels) for train/infer compatibility.
+    Main input stays stacked ``[x_t, mask, masked]`` (3 channels).
+    Structure input is masked ``[edge, line, dot]`` (Canny / Hough / Shi-Tomasi).
     """
 
     def __init__(
@@ -62,6 +63,8 @@ class DiffusionTransformer(nn.Module):
         stem_channels: int = 64,
         mid_channels: int = 64,
         mask_attn_bias: float = 4.0,
+        structure_depth: int = 4,
+        structure_channels: int = 3,
     ):
         super().__init__()
         if img_size % patch_size != 0:
@@ -70,14 +73,22 @@ class DiffusionTransformer(nn.Module):
             )
         if in_channels != 3:
             raise ValueError("blind DiT expects in_channels=3 ([x_t, mask, masked])")
+        if structure_channels != 3:
+            raise ValueError(
+                "structure expects 3 channels ([edge-canny, line-hough, dot-shi-tomasi])"
+            )
+        if structure_depth < 1:
+            raise ValueError(f"structure_depth must be >= 1, got {structure_depth}")
 
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
+        self.structure_channels = structure_channels
         self.gt_channels = 1
         self.out_channels = self.gt_channels * (2 if learn_sigma else 1)
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.depth = depth
+        self.structure_depth = int(structure_depth)
         self.img_size = img_size
         self.ffc_blocks = int(ffc_blocks)
         self.stem_channels = int(stem_channels)
@@ -93,11 +104,25 @@ class DiffusionTransformer(nn.Module):
         self.mask_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
         self.masked_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
 
+        # Structure stream: masked [edge, line, dot].
+        self.structure_stem = ConvStem(
+            in_channels=structure_channels, out_channels=self.stem_channels
+        )
+        self.structure_feat_embedder = PatchEmbed(
+            img_size, patch_size, self.stem_channels, hidden_size
+        )
+        self.edge_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
+        self.line_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
+        self.dot_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
         num_patches = self.feat_embedder.num_patches
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.structure_pos_embed = nn.Parameter(
+            torch.zeros(1, num_patches, hidden_size), requires_grad=False
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -111,6 +136,33 @@ class DiffusionTransformer(nn.Module):
                 for _ in range(depth)
             ]
         )
+        self.structure_blocks = nn.ModuleList(
+            [
+                DiTBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                )
+                for _ in range(self.structure_depth)
+            ]
+        )
+        # Main ← structure cross-attn, interleaved evenly across main depth.
+        self.cross_blocks = nn.ModuleList(
+            [
+                DiTCrossBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                )
+                for _ in range(self.structure_depth)
+            ]
+        )
+        self._cross_interval = max(1, depth // self.structure_depth)
+
         # Unpatchify to mid-channel maps; FFC runs here (not on 1-ch eps).
         self.final_layer = FinalLayer(hidden_size, patch_size, self.mid_channels)
         if self.ffc_blocks > 0:
@@ -138,8 +190,17 @@ class DiffusionTransformer(nn.Module):
             int(self.feat_embedder.num_patches**0.5),
         )
         self.pos_embed.data.copy_(pos_embed.unsqueeze(0))
+        self.structure_pos_embed.data.copy_(pos_embed.unsqueeze(0))
 
-        for embedder in (self.feat_embedder, self.mask_embedder, self.masked_embedder):
+        for embedder in (
+            self.feat_embedder,
+            self.mask_embedder,
+            self.masked_embedder,
+            self.structure_feat_embedder,
+            self.edge_embedder,
+            self.line_embedder,
+            self.dot_embedder,
+        ):
             w = embedder.proj.weight.data
             nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
             nn.init.constant_(embedder.proj.bias, 0)
@@ -148,7 +209,7 @@ class DiffusionTransformer(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        for block in self.blocks:
+        for block in list(self.blocks) + list(self.structure_blocks) + list(self.cross_blocks):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
@@ -179,15 +240,26 @@ class DiffusionTransformer(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         y: torch.Tensor,
+        structure: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         x: (N, 3, H, W) stacked ``x_t``, mask, masked
+        structure: (N, 3, H, W) stacked masked edge / line / dot
         t: (N,) diffusion timesteps
         y: (N,) class labels
         returns: (N, out_channels, H, W)
         """
         mask = x[:, 1:2]
         masked = x[:, 2:3]
+        if structure is None:
+            structure = torch.zeros(
+                x.shape[0],
+                self.structure_channels,
+                x.shape[2],
+                x.shape[3],
+                device=x.device,
+                dtype=x.dtype,
+            )
 
         feat = self.stem(x)
         tokens = (
@@ -196,13 +268,43 @@ class DiffusionTransformer(nn.Module):
             + self.masked_embedder(masked)
             + self.pos_embed
         )
+
+        edge, line, dot = structure[:, 0:1], structure[:, 1:2], structure[:, 2:3]
+        struct_feat = self.structure_stem(structure)
+        struct_tokens = (
+            self.structure_feat_embedder(struct_feat)
+            + self.edge_embedder(edge)
+            + self.line_embedder(line)
+            + self.dot_embedder(dot)
+            + self.structure_pos_embed
+        )
+
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y, self.training)
         c = t_emb + y_emb
         attn_bias = self._mask_attn_bias(mask)
 
-        for block in self.blocks:
+        for block in self.structure_blocks:
+            struct_tokens = block(struct_tokens, c, attn_bias=attn_bias)
+
+        cross_i = 0
+        for i, block in enumerate(self.blocks):
             tokens = block(tokens, c, attn_bias=attn_bias)
+            if (
+                cross_i < len(self.cross_blocks)
+                and (i + 1) % self._cross_interval == 0
+            ):
+                tokens = self.cross_blocks[cross_i](
+                    tokens, struct_tokens, c, attn_bias=attn_bias
+                )
+                cross_i += 1
+
+        # If depth not divisible by structure_depth, apply remaining cross blocks.
+        while cross_i < len(self.cross_blocks):
+            tokens = self.cross_blocks[cross_i](
+                tokens, struct_tokens, c, attn_bias=attn_bias
+            )
+            cross_i += 1
 
         h = self.final_layer(tokens, c)
         h = self.unpatchify(h, self.mid_channels)
@@ -218,11 +320,16 @@ class DiffusionTransformer(nn.Module):
         t: torch.Tensor,
         y: torch.Tensor,
         cfg_scale: float,
+        structure: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Classifier-free guidance forward pass."""
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        struct = None
+        if structure is not None:
+            half_s = structure[: len(structure) // 2]
+            struct = torch.cat([half_s, half_s], dim=0)
+        model_out = self.forward(combined, t, y, structure=struct)
         eps, rest = model_out[:, : self.gt_channels], model_out[:, self.gt_channels :]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)

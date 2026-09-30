@@ -93,11 +93,19 @@ def build_dataloaders(
 def _prepare_batch(
     batch: Dict[str, torch.Tensor],
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     gt = batch["gt"].to(device, non_blocking=True)
     mask = batch["mask"].to(device, non_blocking=True)
     masked = batch["masked"].to(device, non_blocking=True)
-    return gt, mask, masked
+    structure = torch.cat(
+        [
+            batch["edge"].to(device, non_blocking=True),
+            batch["line"].to(device, non_blocking=True),
+            batch["dot"].to(device, non_blocking=True),
+        ],
+        dim=1,
+    )
+    return gt, mask, masked, structure
 
 
 def _model_input(x_t: torch.Tensor, mask: torch.Tensor, masked: torch.Tensor) -> torch.Tensor:
@@ -132,12 +140,12 @@ def evaluate(
     total = 0.0
     count = 0
     for batch in tqdm(loader, desc="val", leave=False):
-        gt, mask, masked = _prepare_batch(batch, device)
+        gt, mask, masked, structure = _prepare_batch(batch, device)
         b = gt.shape[0]
         t = torch.randint(0, schedule.num_timesteps, (b,), device=device)
         x_t, noise = schedule.blind_q_sample(gt, mask, masked, t)
         y = torch.zeros(b, dtype=torch.long, device=device)
-        out = raw(_model_input(x_t, mask, masked), t, y)
+        out = raw(_model_input(x_t, mask, masked), t, y, structure=structure)
         if prediction == "x0":
             x0_pred = _pred_channels(out)
             loss = masked_mse_loss(x0_pred, gt, mask)
@@ -149,7 +157,13 @@ def evaluate(
         count += b
         if image_metrics is not None:
             pred = schedule.inpaint_onestep(
-                raw, mask, masked, y=y, t_value=infer_t, prediction=prediction
+                raw,
+                mask,
+                masked,
+                y=y,
+                t_value=infer_t,
+                prediction=prediction,
+                structure=structure,
             )
             image_metrics.update(pred, gt, mask)
 
@@ -207,7 +221,7 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"train epoch {epoch}", leave=False)
 
     for batch in pbar:
-        gt, mask, masked = _prepare_batch(batch, device)
+        gt, mask, masked, structure = _prepare_batch(batch, device)
         b = gt.shape[0]
         t = torch.randint(0, schedule.num_timesteps, (b,), device=device)
         x_t, noise = schedule.blind_q_sample(gt, mask, masked, t)
@@ -217,7 +231,7 @@ def train_one_epoch(
         x0_l1_w = (t < t_max_x0_l1).float() if use_x0_l1 else None
 
         optimizer_g.zero_grad(set_to_none=True)
-        out = model(_model_input(x_t, mask, masked), t, y)
+        out = model(_model_input(x_t, mask, masked), t, y, structure=structure)
         if prediction == "x0":
             x0_pred = _pred_channels(out)
             loss_mse = masked_mse_loss(x0_pred, gt, mask)
@@ -486,8 +500,9 @@ def train(args: argparse.Namespace) -> None:
             f"adv_mse_threshold={args.adv_mse_threshold} ssim_weight={args.ssim_weight} "
             f"ssim_mse_threshold={args.ssim_mse_threshold} "
             f"x0_l1_weight={args.x0_l1_weight} x0_l1_t_max_frac={args.x0_l1_t_max_frac} "
-            f"best_score=w_psnr*{args.best_psnr_weight}+w_ssim*{args.best_ssim_weight}"
-            f"-w_fid*{args.best_fid_weight} "
+            f"best_score=w_psnr*{args.best_psnr_weight}*(psnr/20)"
+            f"+w_ssim*{args.best_ssim_weight}*(ssim/1)"
+            f"-w_fid*{args.best_fid_weight}*(fid/100) "
             f"dropout={drop} lr={args.lr}",
             log_path,
         )
@@ -918,19 +933,19 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         "--best-psnr-weight",
         type=float,
         default=d["best_psnr_weight"],
-        help="Weight for psnr_masked in best-model selection score.",
+        help="Weight on (psnr_masked/20) in best-model selection score.",
     )
     p.add_argument(
         "--best-ssim-weight",
         type=float,
         default=d["best_ssim_weight"],
-        help="Weight for ssim_masked in best-model selection score.",
+        help="Weight on (ssim_masked/1) in best-model selection score.",
     )
     p.add_argument(
         "--best-fid-weight",
         type=float,
         default=d["best_fid_weight"],
-        help="Weight for fid_masked in best-model selection score (subtracted).",
+        help="Weight on (fid_masked/100) in best-model selection score (subtracted).",
     )
     p.add_argument("--num-timesteps", type=int, default=d["num_timesteps"])
     p.add_argument(

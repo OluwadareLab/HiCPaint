@@ -74,6 +74,56 @@ def make_diagonal_line(
     return line
 
 
+def make_hough_line(
+    gray01: np.ndarray,
+    edge: Optional[np.ndarray] = None,
+    threshold: int = 40,
+    min_line_length: int = 20,
+    max_line_gap: int = 8,
+) -> np.ndarray:
+    """Probabilistic Hough lines from Canny edges -> float32 HxW in {0,1}."""
+    if edge is None:
+        edge = make_canny_edge(gray01)
+    u8 = np.clip(edge * 255.0, 0, 255).astype(np.uint8)
+    lines = cv2.HoughLinesP(
+        u8,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=int(threshold),
+        minLineLength=int(min_line_length),
+        maxLineGap=int(max_line_gap),
+    )
+    out = np.zeros(gray01.shape[:2], dtype=np.float32)
+    if lines is not None:
+        for x1, y1, x2, y2 in lines[:, 0]:
+            cv2.line(out, (int(x1), int(y1)), (int(x2), int(y2)), 1.0, 1)
+    return out
+
+
+def make_shi_tomasi_dots(
+    gray01: np.ndarray,
+    max_corners: int = 256,
+    quality_level: float = 0.01,
+    min_distance: float = 8.0,
+) -> np.ndarray:
+    """Shi-Tomasi corners as binary dots -> float32 HxW in {0,1}."""
+    u8 = np.clip(gray01 * 255.0, 0, 255).astype(np.uint8)
+    corners = cv2.goodFeaturesToTrack(
+        u8,
+        maxCorners=int(max_corners),
+        qualityLevel=float(quality_level),
+        minDistance=float(min_distance),
+        useHarrisDetector=False,
+    )
+    out = np.zeros(gray01.shape[:2], dtype=np.float32)
+    if corners is not None:
+        for x, y in corners[:, 0]:
+            xi, yi = int(round(x)), int(round(y))
+            if 0 <= yi < out.shape[0] and 0 <= xi < out.shape[1]:
+                out[yi, xi] = 1.0
+    return out
+
+
 def _to_1c(arr: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(arr.astype(np.float32)).unsqueeze(0)
 
@@ -92,7 +142,7 @@ class ImageDataset(Dataset):
         self.image_paths = image_paths
         self.mask_size = mask_size
         self.edge_sigma = edge_sigma
-        self.line_band = line_band
+        self.line_band = line_band  # kept for API compat; unused (Hough replaces it)
         self.seed = seed
         self.deterministic_masks = deterministic_masks
         self.image_size = image_size
@@ -124,8 +174,10 @@ class ImageDataset(Dataset):
         mask = make_diagonal_mask(h, w, self.mask_size, rng)
         keep = 1.0 - mask
         masked = gray * keep
-        edge = make_canny_edge(gray, sigma=self.edge_sigma) * keep
-        line = make_diagonal_line(h, w, band=self.line_band) * keep
+        edge_full = make_canny_edge(gray, sigma=self.edge_sigma)
+        edge = edge_full * keep
+        line = make_hough_line(gray, edge=edge_full) * keep
+        dot = make_shi_tomasi_dots(gray) * keep
 
         return {
             "gt": _to_1c(gray),
@@ -133,6 +185,7 @@ class ImageDataset(Dataset):
             "masked": _to_1c(masked),
             "edge": _to_1c(edge),
             "line": _to_1c(line),
+            "dot": _to_1c(dot),
         }
 
 
