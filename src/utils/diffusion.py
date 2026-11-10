@@ -30,6 +30,62 @@ class DiffusionSchedule(nn.Module):
         out = values.gather(0, t.long())
         return out.reshape(-1, *([1] * (len(shape) - 1)))
 
+    def sample_timesteps(
+        self,
+        batch_size: int,
+        device: torch.device,
+        high_t_bias: float = 0.0,
+    ) -> torch.Tensor:
+        """Uniform timesteps, with ``high_t_bias`` of them drawn from the top decile.
+
+        One-step inference runs at ``t = T - 1``, so over-sampling high ``t`` keeps
+        training aligned with the regime actually used at inference.
+        """
+        t = torch.randint(0, self.num_timesteps, (batch_size,), device=device)
+        bias = float(high_t_bias)
+        if bias <= 0.0:
+            return t
+        low = int(self.num_timesteps * 0.9)
+        high = torch.randint(low, self.num_timesteps, (batch_size,), device=device)
+        pick = torch.rand(batch_size, device=device) < bias
+        return torch.where(pick, high, t)
+
+    def apply_zero_hole(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        mask: torch.Tensor,
+        masked: torch.Tensor,
+        prob: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """With ``prob`` per sample, set ``t = T-1`` and zero the hole (one-step infer regime)."""
+        if float(prob) <= 0.0:
+            return x_t, t
+        pick = torch.rand(t.shape[0], device=t.device) < float(prob)
+        t = torch.where(pick, torch.full_like(t, self.num_timesteps - 1), t)
+        zeroed = (1.0 - mask) * masked
+        x_t = torch.where(pick.view(-1, 1, 1, 1), zeroed, x_t)
+        return x_t, t
+
+    def min_snr_weights(
+        self,
+        t: torch.Tensor,
+        gamma: float = 5.0,
+        prediction: str = "x0",
+    ) -> torch.Tensor:
+        """Min-SNR-gamma per-sample loss weights ``(B,)``, normalized to mean 1.
+
+        ``gamma <= 0`` returns all-ones. Normalizing keeps the loss magnitude (and
+        therefore the ``*_mse_threshold`` unlock gates) comparable across settings.
+        """
+        if float(gamma) <= 0.0:
+            return torch.ones_like(t, dtype=torch.float32)
+        abar = self.alphas_cumprod.gather(0, t.long())
+        snr = abar / (1.0 - abar).clamp_min(1e-8)
+        capped = snr.clamp(max=float(gamma))
+        w = capped / snr.clamp_min(1e-8) if prediction == "eps" else capped
+        return w / w.mean().clamp_min(1e-8)
+
     def q_sample(
         self,
         x0: torch.Tensor,
@@ -145,6 +201,7 @@ class DiffusionSchedule(nn.Module):
         t_value: int = -1,
         prediction: str = "x0",
         structure: torch.Tensor | None = None,
+        zero_hole: bool = True,
     ) -> torch.Tensor:
         """Single-pass blind inpaint: noise in hole → predict clean ``x0`` → compose.
 
@@ -160,7 +217,10 @@ class DiffusionSchedule(nn.Module):
             tv = self.num_timesteps - 1
         tv = max(0, min(tv, self.num_timesteps - 1))
 
-        x = (1.0 - mask) * masked + mask * torch.randn_like(masked)
+        # Zero hole only matches training at t = T-1 with x0 prediction (see apply_zero_hole).
+        x = (1.0 - mask) * masked
+        if not (zero_hole and prediction == "x0" and tv == self.num_timesteps - 1):
+            x = x + mask * torch.randn_like(masked)
         t = torch.full((b,), tv, device=device, dtype=torch.long)
         out = model(torch.cat([x, mask, masked], dim=1), t, y, structure=structure)
         if prediction == "x0":

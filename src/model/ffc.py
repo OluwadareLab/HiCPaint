@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from .hybrid import ConvStem
 from .norm import LayerNorm2d
 
 
@@ -17,14 +18,19 @@ class FourierUnit(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         b, c, h, w = x.shape
-        ffted = torch.fft.rfftn(x, dim=(-2, -1), norm="ortho")
-        ffted = torch.stack([ffted.real, ffted.imag], dim=-1)
-        ffted = ffted.permute(0, 1, 4, 2, 3).contiguous()
-        ffted = ffted.view(b, c * 2, h, ffted.shape[-1])
-        ffted = self.act(self.norm(self.conv(ffted)))
-        ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous()
-        ffted = torch.complex(ffted[..., 0], ffted[..., 1])
-        return torch.fft.irfftn(ffted, s=(h, w), dim=(-2, -1), norm="ortho")
+        dtype = x.dtype
+        # cuFFT has no half/bfloat16 kernels, so the whole unit runs in fp32.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            ffted = torch.fft.rfftn(x, dim=(-2, -1), norm="ortho")
+            ffted = torch.stack([ffted.real, ffted.imag], dim=-1)
+            ffted = ffted.permute(0, 1, 4, 2, 3).contiguous()
+            ffted = ffted.view(b, c * 2, h, ffted.shape[-1])
+            ffted = self.act(self.norm(self.conv(ffted)))
+            ffted = ffted.view(b, c, 2, h, -1).permute(0, 1, 3, 4, 2).contiguous()
+            ffted = torch.complex(ffted[..., 0], ffted[..., 1])
+            out = torch.fft.irfftn(ffted, s=(h, w), dim=(-2, -1), norm="ortho")
+        return out.to(dtype)
 
 
 class FFC(nn.Module):
@@ -58,3 +64,44 @@ class FFCBlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x + self.norm(self.ffc(x))
+
+
+class FFCEncoder(nn.Module):
+    """ConvStem then residual FFC blocks: local dots/lines/edges + global context.
+
+    Runs before patchify so the DiT trunk receives tokens that already carry
+    both spatial (conv branch) and whole-map frequency (Fourier branch) structure.
+    ``downsample`` > 1 shrinks the map before the FFT blocks.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        blocks: int = 4,
+        ratio_global: float = 0.5,
+        downsample: int = 1,
+    ):
+        super().__init__()
+        if blocks < 0:
+            raise ValueError(f"blocks must be >= 0, got {blocks}")
+        if downsample < 1:
+            raise ValueError(f"downsample must be >= 1, got {downsample}")
+        if blocks > 0 and not (0.0 < float(ratio_global) < 1.0):
+            raise ValueError(f"ratio_global must be in (0, 1), got {ratio_global}")
+
+        self.downsample = int(downsample)
+        self.stem = ConvStem(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=self.downsample,
+        )
+        self.blocks = nn.Sequential(
+            *[
+                FFCBlock(out_channels, ratio_global=ratio_global)
+                for _ in range(int(blocks))
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.blocks(self.stem(x))

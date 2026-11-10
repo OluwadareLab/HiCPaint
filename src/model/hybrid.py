@@ -7,16 +7,27 @@ from .norm import LayerNorm2d
 
 
 class ConvStem(nn.Module):
-    """Local CNN encoder over ``[x_t, mask, masked]`` before DiT tokens."""
+    """Local CNN encoder over ``[x_t, mask, masked]`` before DiT tokens.
 
-    def __init__(self, in_channels: int = 3, out_channels: int = 64):
+    ``stride`` > 1 downsamples in the second conv (cheaper downstream FFT).
+    """
+
+    def __init__(self, in_channels: int = 3, out_channels: int = 64, stride: int = 1):
         super().__init__()
         mid = max(out_channels // 2, 16)
+        self.stride = int(stride)
         self.net = nn.Sequential(
             nn.Conv2d(in_channels, mid, kernel_size=3, padding=1, bias=False),
             LayerNorm2d(mid),
             nn.GELU(),
-            nn.Conv2d(mid, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.Conv2d(
+                mid,
+                out_channels,
+                kernel_size=3,
+                stride=self.stride,
+                padding=1,
+                bias=False,
+            ),
             LayerNorm2d(out_channels),
             nn.GELU(),
         )
@@ -25,18 +36,44 @@ class ConvStem(nn.Module):
         return self.net(x)
 
 
-class ConvDecoder(nn.Module):
-    """Map mid-res features to noise / x0 channels."""
+class ResConvBlock(nn.Module):
+    """Residual 3x3 conv pair; stacked as the output stage after the transformer."""
 
-    def __init__(self, in_channels: int, out_channels: int):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            LayerNorm2d(channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.net(x)
+
+
+class ConvDecoder(nn.Module):
+    """Map mid-res features to noise / x0 channels, optionally upsampling first."""
+
+    def __init__(self, in_channels: int, out_channels: int, upsample: int = 1):
         super().__init__()
         mid = max(in_channels // 2, out_channels)
-        self.net = nn.Sequential(
+        layers: list[nn.Module] = []
+        if upsample > 1:
+            layers += [
+                nn.Upsample(scale_factor=upsample, mode="bilinear", align_corners=False),
+                nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1, bias=False),
+                LayerNorm2d(in_channels),
+                nn.GELU(),
+            ]
+        layers += [
             nn.Conv2d(in_channels, mid, kernel_size=3, padding=1, bias=False),
             LayerNorm2d(mid),
             nn.GELU(),
             nn.Conv2d(mid, out_channels, kernel_size=3, padding=1, bias=True),
-        )
+        ]
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)

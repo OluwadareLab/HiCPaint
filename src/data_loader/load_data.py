@@ -9,8 +9,7 @@ from torch.utils.data import Dataset
 _EPSILON = 1e-8
 
 
-def normalize_hic(array: np.ndarray) -> np.ndarray:
-    """log2(clip) then per-map min-max to [0, 1]. Returns float32 HxW."""
+def _as_2d(array: np.ndarray) -> np.ndarray:
     values = np.asarray(array, dtype=np.float32)
     values = np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
     values = np.squeeze(values)
@@ -20,15 +19,26 @@ def normalize_hic(array: np.ndarray) -> np.ndarray:
         values = values[..., 0]
     if values.ndim != 2:
         raise ValueError(f"Expected 2D Hi-C map, got shape {array.shape}")
+    return values
 
-    values = np.log2(np.clip(values, _EPSILON, None))
-    low = float(values.min())
-    high = float(values.max())
-    if high > low:
-        values = (values - low) / (high - low)
+
+def normalize_hic(array: np.ndarray, clip_pct: float = 99.5) -> np.ndarray:
+    """log1p then per-map percentile scale to [0, 1]. Returns float32 HxW.
+
+    Zero counts stay at 0 (not a far-negative log value), so dropouts don't
+    dominate the dynamic range.
+    """
+    values = np.log1p(np.clip(_as_2d(array), 0.0, None))
+    high = float(np.percentile(values, clip_pct))
+    if high > _EPSILON:
+        values = values / high
     else:
         values = np.zeros_like(values)
     return np.clip(values, 0.0, 1.0).astype(np.float32)
+
+
+def zero_fraction(array: np.ndarray) -> float:
+    return float(np.mean(_as_2d(array) <= 0.0))
 
 
 def make_diagonal_mask(
@@ -45,6 +55,39 @@ def make_diagonal_mask(
     mask = np.zeros((height, width), dtype=np.float32)
     mask[top: top + size, left: left + size] = 1.0
     return mask
+
+
+MASK_PLACEMENTS = ("diagonal", "random", "mixed")
+
+
+def make_random_mask(
+    height: int, width: int, size: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Random square hole anywhere (independent row/col offsets). 1 = hole."""
+    if size > min(height, width):
+        raise ValueError(f"Mask size {size} exceeds image {height}x{width}")
+    top = int(rng.integers(0, height - size + 1))
+    left = int(rng.integers(0, width - size + 1))
+    mask = np.zeros((height, width), dtype=np.float32)
+    mask[top: top + size, left: left + size] = 1.0
+    return mask
+
+
+def make_mask(
+    height: int,
+    width: int,
+    size: int,
+    rng: np.random.Generator,
+    placement: str = "mixed",
+) -> np.ndarray:
+    """Hole mask by ``placement``: diagonal | random | mixed (50/50)."""
+    if placement not in MASK_PLACEMENTS:
+        raise ValueError(f"mask placement must be one of {MASK_PLACEMENTS}, got {placement!r}")
+    if placement == "mixed":
+        placement = "diagonal" if rng.random() < 0.5 else "random"
+    if placement == "diagonal":
+        return make_diagonal_mask(height, width, size, rng)
+    return make_random_mask(height, width, size, rng)
 
 
 def make_canny_edge(gray01: np.ndarray, sigma: float = 3.0) -> np.ndarray:
@@ -138,9 +181,15 @@ class ImageDataset(Dataset):
         seed: int = 42,
         deterministic_masks: bool = False,
         image_size: Optional[int] = None,
+        mask_placement: str = "mixed",
     ):
+        if mask_placement not in MASK_PLACEMENTS:
+            raise ValueError(
+                f"mask_placement must be one of {MASK_PLACEMENTS}, got {mask_placement!r}"
+            )
         self.image_paths = image_paths
         self.mask_size = mask_size
+        self.mask_placement = mask_placement
         self.edge_sigma = edge_sigma
         self.line_band = line_band  # kept for API compat; unused (Hough replaces it)
         self.seed = seed
@@ -171,7 +220,7 @@ class ImageDataset(Dataset):
             rng = self._epoch_rng
 
         h, w = gray.shape
-        mask = make_diagonal_mask(h, w, self.mask_size, rng)
+        mask = make_mask(h, w, self.mask_size, rng, self.mask_placement)
         keep = 1.0 - mask
         masked = gray * keep
         edge_full = make_canny_edge(gray, sigma=self.edge_sigma)
@@ -230,6 +279,27 @@ class CustomDataset:
         idx.sort()
         return [paths[i] for i in idx]
 
+    def _filter_sparse(self, paths: List[str], max_zero_frac: float) -> List[str]:
+        """Drop maps with more than ``max_zero_frac`` zero pixels (cached per record file)."""
+        if max_zero_frac >= 1.0 or not paths:
+            return paths
+        cache = f"{self.record_file}.zf{max_zero_frac:g}.keep"
+        if os.path.isfile(cache) and os.path.getmtime(cache) >= os.path.getmtime(
+            self.record_file
+        ):
+            with open(cache, "r") as fid:
+                keep = {line.strip() for line in fid if line.strip()}
+            return [p for p in paths if p in keep]
+        kept = [p for p in paths if zero_fraction(np.load(p)) <= max_zero_frac]
+        tmp = f"{cache}.{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as fid:
+                fid.write("\n".join(kept) + "\n")
+            os.replace(tmp, cache)
+        except OSError:
+            pass
+        return kept
+
     def get_dataset(
         self,
         mask_size: int = 64,
@@ -240,10 +310,12 @@ class CustomDataset:
         image_size: Optional[int] = None,
         augment: bool = False,
         subset_fraction: float = 1.0,
+        mask_placement: str = "mixed",
+        max_zero_frac: float = 0.5,
     ) -> ImageDataset:
         del augment  # reserved; flips not applied to structured Hi-C yet
         paths = self._subset_paths(
-            self._prep_paths(),
+            self._filter_sparse(self._prep_paths(), float(max_zero_frac)),
             seed=seed,
             subset_fraction=subset_fraction,
         )
@@ -255,4 +327,5 @@ class CustomDataset:
             seed=seed,
             deterministic_masks=deterministic_masks,
             image_size=image_size,
+            mask_placement=mask_placement,
         )

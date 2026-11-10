@@ -84,6 +84,8 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
         )
         q, k, v = qkv.unbind(0)
 
+        if attn_bias is not None:
+            attn_bias = attn_bias.to(dtype=q.dtype)
         x = F.scaled_dot_product_attention(
             q,
             k,
@@ -99,7 +101,7 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
 
 
 class CrossAttention(nn.Module):
-    """Multi-head cross-attention: queries from ``x``, keys/values from ``context``."""
+    """Multi-head cross-attention (SDPA): queries from ``x``, K/V from ``context``."""
 
     def __init__(
         self,
@@ -113,11 +115,10 @@ class CrossAttention(nn.Module):
         assert dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.scale = self.head_dim**-0.5
+        self.attn_drop = attn_drop
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
         self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
@@ -137,13 +138,17 @@ class CrossAttention(nn.Module):
         )
         k, v = kv.unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
         if attn_bias is not None:
-            attn = attn + attn_bias
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(b, n, c)
+            attn_bias = attn_bias.to(dtype=q.dtype)
+        x = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_bias,
+            dropout_p=self.attn_drop if self.training else 0.0,
+            is_causal=False,
+        )
+        x = x.transpose(1, 2).reshape(b, n, c)
         x = self.proj(x)
         x = self.proj_drop(x)
         return x

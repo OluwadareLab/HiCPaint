@@ -12,7 +12,7 @@ import torch
 from tqdm import tqdm
 
 from src.configs import DEFAULT_CONFIG_PATH, config_to_test_defaults, load_config
-from src.data_loader.load_data import CustomDataset
+from src.data_loader.load_data import MASK_PLACEMENTS, CustomDataset
 from src.metric import ValImageMetrics
 from src.model import DiffusionTransformer
 from src.utils import (
@@ -129,15 +129,25 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=d["seed"])
     p.add_argument("--mask-size", type=int, default=d["mask_size"])
+    p.add_argument(
+        "--mask-placement", choices=MASK_PLACEMENTS, default=d["mask_placement"]
+    )
     p.add_argument("--subset-fraction", type=float, default=d["subset_fraction"])
     p.add_argument("--image-size", type=int, default=d["image_size"])
     p.add_argument("--patch-size", type=int, default=d["patch_size"])
     p.add_argument("--hidden-size", type=int, default=d["hidden_size"])
     p.add_argument("--depth", type=int, default=d["depth"])
+    p.add_argument("--structure-depth", type=int, default=d["structure_depth"])
     p.add_argument("--num-heads", type=int, default=d["num_heads"])
     p.add_argument("--ffc-blocks", type=int, default=d["ffc_blocks"])
+    p.add_argument("--ffc-ratio-global", type=float, default=d["ffc_ratio_global"])
+    p.add_argument("--ffc-downsample", type=int, default=d["ffc_downsample"])
+    p.add_argument("--lg-blocks", type=int, default=d["lg_blocks"])
+    p.add_argument("--lg-window", type=int, default=d["lg_window"])
+    p.add_argument("--lg-pool", type=int, default=d["lg_pool"])
     p.add_argument("--stem-channels", type=int, default=d["stem_channels"])
     p.add_argument("--mid-channels", type=int, default=d["mid_channels"])
+    p.add_argument("--conv-head-blocks", type=int, default=d["conv_head_blocks"])
     p.add_argument("--mask-attn-bias", type=float, default=d["mask_attn_bias"])
     p.add_argument("--num-timesteps", type=int, default=d["num_timesteps"])
     p.add_argument(
@@ -192,9 +202,16 @@ def load_model(args: argparse.Namespace, device: torch.device) -> DiffusionTrans
         num_classes=num_classes,
         learn_sigma=args.learn_sigma,
         ffc_blocks=args.ffc_blocks,
+        ffc_ratio_global=args.ffc_ratio_global,
+        ffc_downsample=args.ffc_downsample,
         stem_channels=args.stem_channels,
         mid_channels=args.mid_channels,
         mask_attn_bias=args.mask_attn_bias,
+        structure_depth=args.structure_depth,
+        lg_blocks=args.lg_blocks,
+        lg_window=args.lg_window,
+        lg_pool=args.lg_pool,
+        conv_head_blocks=args.conv_head_blocks,
     ).to(device)
     model.load_state_dict(state)
     model.eval()
@@ -272,6 +289,7 @@ def run_inference(args: argparse.Namespace) -> None:
         f"device={device} checkpoint={args.checkpoint} split={args.split} "
         f"prediction={args.prediction} infer_t={args.infer_t} "
         f"subset_fraction={args.subset_fraction} "
+        f"mask_placement={args.mask_placement} "
         f"viz_per_chromosome={args.viz_per_chromosome} "
         f"save_npy={int(bool(args.save_npy))}",
         log_path,
@@ -282,6 +300,7 @@ def run_inference(args: argparse.Namespace) -> None:
         img_dir=args.img_dir,
     ).get_dataset(
         mask_size=args.mask_size,
+        mask_placement=args.mask_placement,
         image_size=args.image_size,
         seed=args.seed,
         deterministic_masks=True,

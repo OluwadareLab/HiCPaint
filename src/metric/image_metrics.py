@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -10,9 +10,9 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 
 
 # Typical metric scales so equal weights ≈ equal vote after normalization.
-_PSNR_SCALE = 20.0
+_PSNR_SCALE = 40.0
 _SSIM_SCALE = 1.0
-_FID_SCALE = 100.0
+_FID_SCALE = 350.0
 
 
 def masked_selection_score(
@@ -23,7 +23,7 @@ def masked_selection_score(
 ) -> float:
     """Higher is better on masked hole (scale-normalized):
 
-    ``w_psnr*(PSNR/20) + w_ssim*(SSIM/1) - w_fid*(FID/100)``
+    ``w_psnr*(PSNR/40) + w_ssim*(SSIM/1) - w_fid*(FID/350)``
 
     Default weights=1 → equal contribution at typical ranges. FID may be NaN
     early (too few samples); then score uses PSNR+SSIM only.
@@ -37,6 +37,79 @@ def masked_selection_score(
     if math.isfinite(fid):
         score -= w_fid * (fid / _FID_SCALE)
     return score
+
+
+def _eligible(
+    history: List[Dict[str, float]], min_epoch: int = 0
+) -> Tuple[List[Dict[str, float]], Tuple[str, ...]]:
+    """Entries competing for best, plus the metric keys in play.
+
+    Once any epoch has a finite FID, epochs without one drop out so all
+    candidates are compared on the same three metrics.
+    """
+    rows = [
+        h
+        for h in history
+        if int(h["epoch"]) >= min_epoch
+        and math.isfinite(float(h["psnr"]))
+        and math.isfinite(float(h["ssim"]))
+    ]
+    with_fid = [h for h in rows if math.isfinite(float(h.get("fid", float("nan"))))]
+    if with_fid:
+        return with_fid, ("psnr", "ssim", "fid")
+    return rows, ("psnr", "ssim")
+
+
+def _oriented(h: Dict[str, float], keys: Tuple[str, ...]) -> Tuple[float, ...]:
+    """Metric vector where higher is better (FID negated)."""
+    return tuple(-float(h[k]) if k == "fid" else float(h[k]) for k in keys)
+
+
+def pareto_front(
+    history: List[Dict[str, float]], min_epoch: int = 0
+) -> List[Dict[str, float]]:
+    """Non-dominated entries over masked PSNR (max), SSIM (max), FID (min)."""
+    rows, keys = _eligible(history, min_epoch)
+    vecs = [_oriented(h, keys) for h in rows]
+    front = []
+    for i, vi in enumerate(vecs):
+        dominated = any(
+            all(a >= b for a, b in zip(vj, vi)) and any(a > b for a, b in zip(vj, vi))
+            for j, vj in enumerate(vecs)
+            if j != i
+        )
+        if not dominated:
+            front.append(rows[i])
+    return front
+
+
+def balanced_pick(
+    history: List[Dict[str, float]], min_epoch: int = 0
+) -> Tuple[Optional[int], Dict[str, float], List[int]]:
+    """Pareto epoch with the highest worst-case normalized metric (maximin).
+
+    Each metric is min-max normalized to [0,1] over all eligible epochs (FID
+    flipped). Ties on the minimum are broken by the mean. Returns
+    ``(best_epoch or None, normalized metrics of best, pareto epochs)``.
+    """
+    rows, keys = _eligible(history, min_epoch)
+    front = pareto_front(history, min_epoch)
+    if not front:
+        return None, {}, []
+    vecs = [_oriented(h, keys) for h in rows]
+    lo = [min(v[i] for v in vecs) for i in range(len(keys))]
+    hi = [max(v[i] for v in vecs) for i in range(len(keys))]
+
+    def norm(h: Dict[str, float]) -> Tuple[float, ...]:
+        v = _oriented(h, keys)
+        return tuple(
+            (v[i] - lo[i]) / (hi[i] - lo[i]) if hi[i] > lo[i] else 1.0
+            for i in range(len(keys))
+        )
+
+    best = max(front, key=lambda h: (min(norm(h)), sum(norm(h)) / len(keys)))
+    best_norm = dict(zip(keys, norm(best)))
+    return int(best["epoch"]), best_norm, sorted(int(h["epoch"]) for h in front)
 
 
 def _to_rgb01(x: torch.Tensor) -> torch.Tensor:

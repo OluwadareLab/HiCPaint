@@ -7,8 +7,9 @@ import torch.nn.functional as F
 
 from .blocks import DiTBlock, DiTCrossBlock, FinalLayer
 from .embeddings import LabelEmbedder, PatchEmbed, TimestepEmbedder
-from .ffc import FFCBlock
-from .hybrid import ConvDecoder, ConvStem, HoleRefine
+from .ffc import FFCEncoder
+from .hybrid import ConvDecoder, HoleRefine, ResConvBlock
+from .localglobal import LocalGlobalBlock, pooled_attn_bias, window_attn_bias
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
@@ -39,7 +40,12 @@ def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.nd
 
 
 class DiffusionTransformer(nn.Module):
-    """Blind-inpaint DiT: CNN stem → DiT ↔ structure DiT (cross-attn) → FFC → hole refine.
+    """Blind-inpaint DiT with an FFC front-end and a local/global attention stage.
+
+    Stage 1: ``FFCEncoder`` on both streams (local conv + Fourier global structure).
+    Stage 2: main DiT trunk with interleaved cross-attention from the structure DiT.
+    Stage 3: ``LocalGlobalBlock`` stack (windowed local + pooled global attention).
+    Stage 4: residual conv head → hole refine.
 
     Main input stays stacked ``[x_t, mask, masked]`` (3 channels).
     Structure input is masked ``[edge, line, dot]`` (Canny / Hough / Shi-Tomasi).
@@ -60,11 +66,17 @@ class DiffusionTransformer(nn.Module):
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
         ffc_blocks: int = 4,
+        ffc_ratio_global: float = 0.5,
+        ffc_downsample: int = 1,
         stem_channels: int = 64,
         mid_channels: int = 64,
         mask_attn_bias: float = 4.0,
         structure_depth: int = 4,
         structure_channels: int = 3,
+        lg_blocks: int = 2,
+        lg_window: int = 4,
+        lg_pool: int = 4,
+        conv_head_blocks: int = 2,
     ):
         super().__init__()
         if img_size % patch_size != 0:
@@ -79,6 +91,32 @@ class DiffusionTransformer(nn.Module):
             )
         if structure_depth < 1:
             raise ValueError(f"structure_depth must be >= 1, got {structure_depth}")
+        if ffc_blocks < 0:
+            raise ValueError(f"ffc_blocks must be >= 0, got {ffc_blocks}")
+        if ffc_blocks > 0 and not (0.0 < float(ffc_ratio_global) < 1.0):
+            raise ValueError(
+                f"ffc_ratio_global must be in (0, 1), got {ffc_ratio_global}"
+            )
+        if ffc_downsample < 1 or patch_size % ffc_downsample != 0:
+            raise ValueError(
+                f"patch_size ({patch_size}) must be divisible by "
+                f"ffc_downsample ({ffc_downsample})"
+            )
+        if lg_blocks < 0:
+            raise ValueError(f"lg_blocks must be >= 0, got {lg_blocks}")
+        if conv_head_blocks < 0:
+            raise ValueError(f"conv_head_blocks must be >= 0, got {conv_head_blocks}")
+
+        grid_size = img_size // patch_size
+        if lg_blocks > 0:
+            if grid_size % lg_window != 0:
+                raise ValueError(
+                    f"token grid ({grid_size}) must be divisible by lg_window ({lg_window})"
+                )
+            if grid_size % lg_pool != 0:
+                raise ValueError(
+                    f"token grid ({grid_size}) must be divisible by lg_pool ({lg_pool})"
+                )
 
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
@@ -91,25 +129,48 @@ class DiffusionTransformer(nn.Module):
         self.structure_depth = int(structure_depth)
         self.img_size = img_size
         self.ffc_blocks = int(ffc_blocks)
+        self.ffc_ratio_global = float(ffc_ratio_global)
+        self.ffc_downsample = int(ffc_downsample)
         self.stem_channels = int(stem_channels)
         self.mid_channels = int(mid_channels)
         self.mask_attn_bias = float(mask_attn_bias)
+        self.lg_blocks = int(lg_blocks)
+        self.lg_window = int(lg_window)
+        self.lg_pool = int(lg_pool)
+        self.conv_head_blocks = int(conv_head_blocks)
+        self.grid_size = grid_size
 
-        # CNN stem over stacked input, then patchify.
-        self.stem = ConvStem(in_channels=in_channels, out_channels=self.stem_channels)
+        # FFC runs on the (optionally downsampled) feature map, so the token patch
+        # size shrinks with it and the token count stays ``grid_size**2``.
+        feat_size = img_size // self.ffc_downsample
+        self.feat_size = feat_size
+        self.token_patch_size = patch_size // self.ffc_downsample
+
+        # Stage 1: local (conv) + global (Fourier) structure before patchify.
+        self.ffc_encoder = FFCEncoder(
+            in_channels=in_channels,
+            out_channels=self.stem_channels,
+            blocks=self.ffc_blocks,
+            ratio_global=self.ffc_ratio_global,
+            downsample=self.ffc_downsample,
+        )
         self.feat_embedder = PatchEmbed(
-            img_size, patch_size, self.stem_channels, hidden_size
+            feat_size, self.token_patch_size, self.stem_channels, hidden_size
         )
         # Explicit mask / known-context token streams (added to stem tokens).
         self.mask_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
         self.masked_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
 
         # Structure stream: masked [edge, line, dot].
-        self.structure_stem = ConvStem(
-            in_channels=structure_channels, out_channels=self.stem_channels
+        self.structure_ffc_encoder = FFCEncoder(
+            in_channels=structure_channels,
+            out_channels=self.stem_channels,
+            blocks=self.ffc_blocks,
+            ratio_global=self.ffc_ratio_global,
+            downsample=self.ffc_downsample,
         )
         self.structure_feat_embedder = PatchEmbed(
-            img_size, patch_size, self.stem_channels, hidden_size
+            feat_size, self.token_patch_size, self.stem_channels, hidden_size
         )
         self.edge_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
         self.line_embedder = PatchEmbed(img_size, patch_size, 1, hidden_size)
@@ -163,15 +224,32 @@ class DiffusionTransformer(nn.Module):
         )
         self._cross_interval = max(1, depth // self.structure_depth)
 
-        # Unpatchify to mid-channel maps; FFC runs here (not on 1-ch eps).
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.mid_channels)
-        if self.ffc_blocks > 0:
-            self.ffc = nn.Sequential(
-                *[FFCBlock(self.mid_channels, ratio_global=0.5) for _ in range(self.ffc_blocks)]
-            )
-        else:
-            self.ffc = None
-        self.decoder = ConvDecoder(self.mid_channels, self.out_channels)
+        # Stage 3: windowed local + pooled global attention over the same tokens.
+        self.lg_stage = nn.ModuleList(
+            [
+                LocalGlobalBlock(
+                    hidden_size,
+                    num_heads,
+                    mlp_ratio=mlp_ratio,
+                    window=self.lg_window,
+                    pool=self.lg_pool,
+                    attn_drop=attn_drop,
+                    proj_drop=proj_drop,
+                )
+                for _ in range(self.lg_blocks)
+            ]
+        )
+
+        # Stage 4: unpatchify to mid-channel maps, then a pure conv output path.
+        self.final_layer = FinalLayer(
+            hidden_size, self.token_patch_size, self.mid_channels
+        )
+        self.conv_head = nn.Sequential(
+            *[ResConvBlock(self.mid_channels) for _ in range(self.conv_head_blocks)]
+        )
+        self.decoder = ConvDecoder(
+            self.mid_channels, self.out_channels, upsample=self.ffc_downsample
+        )
         self.hole_refine = HoleRefine(self.out_channels)
 
         self.initialize_weights()
@@ -209,7 +287,12 @@ class DiffusionTransformer(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        for block in list(self.blocks) + list(self.structure_blocks) + list(self.cross_blocks):
+        for block in (
+            list(self.blocks)
+            + list(self.structure_blocks)
+            + list(self.cross_blocks)
+            + list(self.lg_stage)
+        ):
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
@@ -219,21 +302,24 @@ class DiffusionTransformer(nn.Module):
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x: torch.Tensor, channels: int) -> torch.Tensor:
-        """``(N, T, patch**2 * C)`` → ``(N, C, H, W)``."""
-        p = self.patch_size
+        """``(N, T, patch**2 * C)`` → ``(N, C, H, W)`` at feature resolution."""
+        p = self.token_patch_size
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
         x = x.reshape(shape=(x.shape[0], h, w, p, p, channels))
         x = torch.einsum("nhwpqc->nchpwq", x)
         return x.reshape(shape=(x.shape[0], channels, h * p, w * p))
 
+    def _patch_key_bias(self, mask: torch.Tensor) -> torch.Tensor:
+        """Per-token key bias grid ``(B, 1, g, g)``: down-weight hole keys (MAT-style)."""
+        patch_hole = F.avg_pool2d(
+            mask, kernel_size=self.patch_size, stride=self.patch_size
+        )
+        return -self.mask_attn_bias * patch_hole
+
     def _mask_attn_bias(self, mask: torch.Tensor) -> torch.Tensor:
-        """Soft bias: down-weight attention keys inside the hole (MAT-style)."""
-        # mask hole=1 → patch hole fraction in [0, 1]
-        patch_hole = F.avg_pool2d(mask, kernel_size=self.patch_size, stride=self.patch_size)
-        patch_hole = patch_hole.flatten(2)  # (B, 1, N)
-        # (B, 1, 1, N) broadcasts over heads and queries
-        return -self.mask_attn_bias * patch_hole.unsqueeze(2)
+        """Full-attention key bias ``(B, 1, 1, N)``, broadcast over heads and queries."""
+        return self._patch_key_bias(mask).flatten(2).unsqueeze(2)
 
     def forward(
         self,
@@ -261,7 +347,7 @@ class DiffusionTransformer(nn.Module):
                 dtype=x.dtype,
             )
 
-        feat = self.stem(x)
+        feat = self.ffc_encoder(x)
         tokens = (
             self.feat_embedder(feat)
             + self.mask_embedder(mask)
@@ -270,7 +356,7 @@ class DiffusionTransformer(nn.Module):
         )
 
         edge, line, dot = structure[:, 0:1], structure[:, 1:2], structure[:, 2:3]
-        struct_feat = self.structure_stem(structure)
+        struct_feat = self.structure_ffc_encoder(structure)
         struct_tokens = (
             self.structure_feat_embedder(struct_feat)
             + self.edge_embedder(edge)
@@ -282,7 +368,8 @@ class DiffusionTransformer(nn.Module):
         t_emb = self.t_embedder(t)
         y_emb = self.y_embedder(y, self.training)
         c = t_emb + y_emb
-        attn_bias = self._mask_attn_bias(mask)
+        patch_bias = self._patch_key_bias(mask)
+        attn_bias = patch_bias.flatten(2).unsqueeze(2)
 
         for block in self.structure_blocks:
             struct_tokens = block(struct_tokens, c, attn_bias=attn_bias)
@@ -306,10 +393,17 @@ class DiffusionTransformer(nn.Module):
             )
             cross_i += 1
 
+        if self.lg_blocks > 0:
+            local_bias = window_attn_bias(patch_bias, self.lg_window)
+            global_bias = pooled_attn_bias(patch_bias, self.lg_pool)
+            for block in self.lg_stage:
+                tokens = block(
+                    tokens, c, local_bias=local_bias, global_bias=global_bias
+                )
+
         h = self.final_layer(tokens, c)
         h = self.unpatchify(h, self.mid_channels)
-        if self.ffc is not None:
-            h = self.ffc(h)
+        h = self.conv_head(h)
         out = self.decoder(h)
         out = self.hole_refine(out, mask)
         return out

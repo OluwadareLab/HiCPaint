@@ -6,6 +6,7 @@ from .distributed import (
     is_main_process,
     unwrap_model,
 )
+from .ema import ModelEma
 from .logger import write_log
 from .schedulers import build_warmup_cosine_scheduler
 from .tracking import (
@@ -19,6 +20,7 @@ __all__ = [
     "write_log",
     "build_warmup_cosine_scheduler",
     "DiffusionSchedule",
+    "ModelEma",
     "append_csv_row",
     "plot_train_val_loss",
     "select_fixed_indices",

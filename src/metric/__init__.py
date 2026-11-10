@@ -1,3 +1,8 @@
-from .image_metrics import ValImageMetrics, masked_selection_score
+from .image_metrics import (
+    ValImageMetrics,
+    balanced_pick,
+    masked_selection_score,
+    pareto_front,
+)
 
-__all__ = ["ValImageMetrics", "masked_selection_score"]
+__all__ = ["ValImageMetrics", "balanced_pick", "masked_selection_score", "pareto_front"]

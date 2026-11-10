@@ -6,13 +6,11 @@ Defaults come from `src/configs/config.yaml`. CLI flags override the config.
 
 ## Train
 
-```bash
-# Single GPU
-python runner.py
-
-# 2 GPUs (DDP)
+# Single GPU  
+python [runner.py](http://runner.py)  
+  
+# 2 GPUs (DDP)  
 torchrun --nproc_per_node=2 runner.py --distributed
-```
 
 Optional overrides:
 
