@@ -33,6 +33,8 @@ METRIC_FIELDS = [
     "ssim_masked",
     "fid",
     "fid_masked",
+    "hicrep",
+    "hicrep_masked",
 ]
 
 _CHR_RE = re.compile(r"(?:^|/)(chr(?:\d+|X|Y|M|MT))(?:/|$)", re.IGNORECASE)
@@ -421,7 +423,9 @@ def run_inference(args: argparse.Namespace) -> None:
             f"ssim={metrics.get('ssim', float('nan')):.4f} "
             f"ssim_masked={metrics.get('ssim_masked', float('nan')):.4f} "
             f"fid={metrics.get('fid', float('nan')):.4f} "
-            f"fid_masked={metrics.get('fid_masked', float('nan')):.4f}",
+            f"fid_masked={metrics.get('fid_masked', float('nan')):.4f} "
+            f"hicrep={metrics.get('hicrep', float('nan')):.4f} "
+            f"hicrep_masked={metrics.get('hicrep_masked', float('nan')):.4f}",
             log_path,
         )
 

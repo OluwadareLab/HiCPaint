@@ -8,6 +8,8 @@ import torch.nn as nn
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
 from torchmetrics.image.fid import FrechetInceptionDistance
 
+from .hicrep import get_hicrep_scc
+
 
 # Typical metric scales so equal weights ≈ equal vote after normalization.
 _PSNR_SCALE = 40.0
@@ -112,6 +114,11 @@ def balanced_pick(
     return int(best["epoch"]), best_norm, sorted(int(h["epoch"]) for h in front)
 
 
+def _nanmean(values: List[float]) -> float:
+    finite = [v for v in values if math.isfinite(v)]
+    return float(sum(finite) / len(finite)) if finite else float("nan")
+
+
 def _to_rgb01(x: torch.Tensor) -> torch.Tensor:
     """(N,1,H,W) or (N,3,H,W) in [0,1] -> (N,3,H,W) float."""
     if x.shape[1] == 1:
@@ -145,9 +152,11 @@ def _crop_hole(
 
 
 class ValImageMetrics(nn.Module):
-    """Accumulates PSNR/SSIM/FID (full + masked-hole) over a val/test/infer pass."""
+    """Accumulates PSNR/SSIM/FID/HiCRep (full + masked-hole) over a val/test/infer pass."""
 
-    def __init__(self, data_range: float = 1.0):
+    def __init__(
+        self, data_range: float = 1.0, hicrep_resol: int = 10000, hicrep_h: int = 1
+    ):
         super().__init__()
         # Rank-0-only val must not all-reduce on compute (DDP is initialized).
         _sync = {"sync_on_compute": False}
@@ -163,8 +172,22 @@ class ValImageMetrics(nn.Module):
         self.fid_masked = FrechetInceptionDistance(
             feature=2048, normalize=True, **_sync
         )
+        self.hicrep_resol = int(hicrep_resol)
+        self.hicrep_h = int(hicrep_h)
+        self._hicrep: List[float] = []
+        self._hicrep_masked: List[float] = []
+
+    def _hicrep_batch(self, pred: torch.Tensor, gt: torch.Tensor) -> List[float]:
+        p = pred[:, 0].detach().float().cpu().numpy()
+        g = gt[:, 0].detach().float().cpu().numpy()
+        return [
+            get_hicrep_scc(p[i], g[i], resol=self.hicrep_resol, h=self.hicrep_h)
+            for i in range(p.shape[0])
+        ]
 
     def reset(self) -> None:
+        self._hicrep.clear()
+        self._hicrep_masked.clear()
         self.psnr.reset()
         self.psnr_masked.reset()
         self.ssim.reset()
@@ -189,6 +212,9 @@ class ValImageMetrics(nn.Module):
         fake_h = _to_rgb01(pred_hole)
         self.fid_masked.update(real_h, real=True)
         self.fid_masked.update(fake_h, real=False)
+        self._hicrep.extend(self._hicrep_batch(pred, gt))
+        if pred_hole.shape[-1] > 1:
+            self._hicrep_masked.extend(self._hicrep_batch(pred_hole, gt_hole))
 
     @torch.no_grad()
     def compute(self) -> Dict[str, float]:
@@ -197,6 +223,8 @@ class ValImageMetrics(nn.Module):
             "psnr_masked": float(self.psnr_masked.compute().item()),
             "ssim": float(self.ssim.compute().item()),
             "ssim_masked": float(self.ssim_masked.compute().item()),
+            "hicrep": _nanmean(self._hicrep),
+            "hicrep_masked": _nanmean(self._hicrep_masked),
         }
         try:
             out["fid"] = float(self.fid.compute().item())

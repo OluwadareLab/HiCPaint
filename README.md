@@ -32,8 +32,5 @@ python -m src.test_lib
 Optional overrides:
 
 ```bash
-python scripts/infer.py \
-  --checkpoint ./output/checkpoints/best_model.pt \
-  --split val \
-  --device cuda:0
+python scripts/infer.py --checkpoint ./output/checkpoints/best_model.pt --split val --device cuda:0
 ```

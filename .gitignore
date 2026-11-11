@@ -53,3 +53,4 @@ graphify-out/
 *.csv
 *.md
 !requirements.txt
+*.zip

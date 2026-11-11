@@ -607,6 +607,8 @@ def train(args: argparse.Namespace) -> None:
         "ssim_masked",
         "fid",
         "fid_masked",
+        "hicrep",
+        "hicrep_masked",
         "val_loss_infer",
     ]
     loss_fields = ["epoch", "train_mse", "val_mse"]
@@ -944,6 +946,8 @@ def train(args: argparse.Namespace) -> None:
                     "ssim_masked": _fmt4("ssim_masked", val_metrics),
                     "fid": _fmt4("fid", val_metrics),
                     "fid_masked": _fmt4("fid_masked", val_metrics),
+                    "hicrep": _fmt4("hicrep", val_metrics),
+                    "hicrep_masked": _fmt4("hicrep_masked", val_metrics),
                     "val_loss_infer": _fmt4("val_loss_infer", val_metrics),
                 },
                 val_fields,
@@ -986,6 +990,8 @@ def train(args: argparse.Namespace) -> None:
                 f"ssim_masked={val_metrics.get('ssim_masked', float('nan')):.4f} "
                 f"fid={val_metrics.get('fid', float('nan')):.4f} "
                 f"fid_masked={val_metrics.get('fid_masked', float('nan')):.4f} "
+                f"hicrep={val_metrics.get('hicrep', float('nan')):.4f} "
+                f"hicrep_masked={val_metrics.get('hicrep_masked', float('nan')):.4f} "
                 f"sel_score={sel_score:.4f} "
                 f"lr={lr:.6e}",
                 log_path,
@@ -1147,6 +1153,8 @@ def train(args: argparse.Namespace) -> None:
             f"test_ssim_masked={test_metrics.get('ssim_masked', float('nan')):.4f} "
             f"test_fid={test_metrics.get('fid', float('nan')):.4f} "
             f"test_fid_masked={test_metrics.get('fid_masked', float('nan')):.4f} "
+            f"test_hicrep={test_metrics.get('hicrep', float('nan')):.4f} "
+            f"test_hicrep_masked={test_metrics.get('hicrep_masked', float('nan')):.4f} "
             f"best_score={best_score:.6f}",
             log_path,
         )
@@ -1159,6 +1167,8 @@ def train(args: argparse.Namespace) -> None:
                 "ssim_masked": f"{test_metrics.get('ssim_masked', float('nan')):.4f}",
                 "fid": f"{test_metrics.get('fid', float('nan')):.4f}",
                 "fid_masked": f"{test_metrics.get('fid_masked', float('nan')):.4f}",
+                "hicrep": f"{test_metrics.get('hicrep', float('nan')):.4f}",
+                "hicrep_masked": f"{test_metrics.get('hicrep_masked', float('nan')):.4f}",
                 "test_loss": f"{test_metrics['val_loss']:.4f}",
                 "best_score": f"{best_score:.4f}",
             },
@@ -1169,6 +1179,8 @@ def train(args: argparse.Namespace) -> None:
                 "ssim_masked",
                 "fid",
                 "fid_masked",
+                "hicrep",
+                "hicrep_masked",
                 "test_loss",
                 "best_score",
             ],
