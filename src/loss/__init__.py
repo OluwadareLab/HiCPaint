@@ -3,6 +3,7 @@ from .losses import (
     adversarial_d_loss,
     adversarial_g_loss,
     distance_weighted_loss,
+    feature_matching_loss,
     gradient_loss,
     insulation_loss,
     masked_charbonnier_loss,
@@ -29,5 +30,6 @@ __all__ = [
     "AdversarialLoss",
     "adversarial_g_loss",
     "adversarial_d_loss",
+    "feature_matching_loss",
     "r1_penalty",
 ]

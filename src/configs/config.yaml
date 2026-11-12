@@ -24,7 +24,7 @@ data:
   subset_fraction: 1.0
 
 training:
-  epochs: 50
+  epochs: 100
   save_every: 5
   lr: 2.0e-4
   min_lr: 1.0e-6
@@ -56,6 +56,7 @@ training:
   adv_weight: 0.05
   adv_mse_threshold: 0.4
   adv_t_max_frac: 1.0
+  fm_weight: 2.0          # D feature-matching L1 on adv-gated samples; 0 disables
   d_lr: 1.0e-4
   adv_real_label: 0.9
   adv_fake_label: 0.1

@@ -65,6 +65,7 @@ class TrainingConfig:
     adv_weight: float = 0.05
     adv_mse_threshold: float = 0.4
     adv_t_max_frac: float = 1.0
+    fm_weight: float = 0.0
     d_lr: float = 1.0e-4
     adv_real_label: float = 0.9
     adv_fake_label: float = 0.1
@@ -209,6 +210,7 @@ def config_to_train_defaults(cfg: Config) -> Dict[str, Any]:
         "adv_weight": cfg.training.adv_weight,
         "adv_mse_threshold": cfg.training.adv_mse_threshold,
         "adv_t_max_frac": cfg.training.adv_t_max_frac,
+        "fm_weight": cfg.training.fm_weight,
         "d_lr": cfg.training.d_lr,
         "adv_real_label": cfg.training.adv_real_label,
         "adv_fake_label": cfg.training.adv_fake_label,

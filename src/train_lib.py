@@ -20,6 +20,7 @@ from src.data_loader.load_data import MASK_PLACEMENTS, CustomDataset, ImageDatas
 from src.loss import (
     AdversarialLoss,
     distance_weighted_loss,
+    feature_matching_loss,
     gradient_loss,
     insulation_loss,
     masked_charbonnier_loss,
@@ -200,6 +201,7 @@ class LossConfig:
     struct_t_max_frac: float = 1.0
     adv_weight: float = 0.05
     adv_t_max_frac: float = 1.0
+    fm_weight: float = 0.0
     min_snr_gamma: float = 0.0
     high_t_bias: float = 0.0
     zero_hole_prob: float = 0.0
@@ -320,6 +322,7 @@ def train_one_epoch(
             "dist",
             "spec",
             "adv_g",
+            "fm",
             "adv_d",
             "total",
         )
@@ -398,8 +401,22 @@ def train_one_epoch(
             if cfg.spectral_weight > 0:
                 loss_spec = spectral_loss(pred, gt, mask, sample_weight=struct_w)
 
+        loss_fm = zero
         if use_adv:
-            fake_logits = unwrap_model(disc)(_disc_input(pred, mask, masked))
+            raw_d = unwrap_model(disc)
+            if cfg.fm_weight > 0:
+                fake_logits, fake_feats = raw_d(
+                    _disc_input(pred, mask, masked), return_feats=True
+                )
+                with torch.no_grad():
+                    _, real_feats = raw_d(
+                        _disc_input(gt, mask, masked), return_feats=True
+                    )
+                loss_fm = feature_matching_loss(
+                    fake_feats, real_feats, sample_weight=adv_w
+                )
+            else:
+                fake_logits = raw_d(_disc_input(pred, mask, masked))
             loss_adv_g = adv_loss.g_loss(fake_logits, sample_weight=adv_w)
         else:
             loss_adv_g = zero
@@ -414,6 +431,7 @@ def train_one_epoch(
             + cfg.dist_weight * loss_dist
             + cfg.spectral_weight * loss_spec
             + cfg.adv_weight * loss_adv_g
+            + cfg.fm_weight * loss_fm
         )
         loss_g.backward()
         if grad_clip > 0:
@@ -455,6 +473,7 @@ def train_one_epoch(
             "dist": loss_dist,
             "spec": loss_spec,
             "adv_g": loss_adv_g,
+            "fm": loss_fm,
             "adv_d": loss_d,
             "total": loss_g,
         }
@@ -704,6 +723,7 @@ def train(args: argparse.Namespace) -> None:
         struct_t_max_frac=float(args.struct_t_max_frac),
         adv_weight=float(args.adv_weight),
         adv_t_max_frac=float(args.adv_t_max_frac),
+        fm_weight=float(args.fm_weight),
         min_snr_gamma=float(args.min_snr_gamma),
         high_t_bias=float(args.high_t_bias),
         zero_hole_prob=float(args.zero_hole_prob),
@@ -733,7 +753,8 @@ def train(args: argparse.Namespace) -> None:
             f"grad_weight={args.grad_weight} dist_weight={args.dist_weight} "
             f"spectral_weight={args.spectral_weight} "
             f"struct_t_max_frac={args.struct_t_max_frac} "
-            f"adv_weight={args.adv_weight} d_r1_gamma={args.d_r1_gamma} "
+            f"adv_weight={args.adv_weight} adv_t_max_frac={args.adv_t_max_frac} "
+            f"fm_weight={args.fm_weight} d_r1_gamma={args.d_r1_gamma} "
             f"d_r1_every={args.d_r1_every} "
             f"adv_mse_threshold={args.adv_mse_threshold} ssim_weight={args.ssim_weight} "
             f"ssim_mse_threshold={args.ssim_mse_threshold} "
@@ -978,6 +999,7 @@ def train(args: argparse.Namespace) -> None:
                 f"train_dist={metrics.get('train_dist', 0.0):.6f} "
                 f"train_spec={metrics.get('train_spec', 0.0):.6f} "
                 f"train_adv_g={metrics.get('train_adv_g', 0.0):.6f} "
+                f"train_fm={metrics.get('train_fm', 0.0):.6f} "
                 f"train_adv_d={metrics.get('train_adv_d', 0.0):.6f} "
                 f"ssim_unlocked={int(ssim_unlocked)} "
                 f"struct_unlocked={int(struct_unlocked)} "
@@ -1331,6 +1353,12 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=d["adv_t_max_frac"],
         help="Apply adversarial loss only for samples with t < frac * num_timesteps.",
+    )
+    p.add_argument(
+        "--fm-weight",
+        type=float,
+        default=d["fm_weight"],
+        help="Weight for discriminator feature-matching L1 on adv-gated samples; 0 disables.",
     )
     p.add_argument(
         "--d-lr",

@@ -436,6 +436,23 @@ class AdversarialLoss(nn.Module):
         return self.d_loss(real_logits, fake_logits, sample_weight)
 
 
+def feature_matching_loss(
+    fake_feats: list[torch.Tensor],
+    real_feats: list[torch.Tensor],
+    sample_weight: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Mean per-layer L1 between D features on fake vs real; optional per-sample weights."""
+    total = fake_feats[0].new_zeros(())
+    for f, r in zip(fake_feats, real_feats):
+        err = (f.float() - r.detach().float()).abs().flatten(1).mean(dim=1)
+        if sample_weight is None:
+            total = total + err.mean()
+        else:
+            w = sample_weight.to(err.dtype)
+            total = total + (err * w).sum() / w.sum().clamp_min(1.0)
+    return total / max(1, len(fake_feats))
+
+
 def r1_penalty(
     real_logits: torch.Tensor,
     real_input: torch.Tensor,

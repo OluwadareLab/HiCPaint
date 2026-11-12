@@ -62,5 +62,14 @@ class PatchDiscriminator(nn.Module):
         ]
         self.model = nn.Sequential(*layers)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.model(x)
+    def forward(
+        self, x: torch.Tensor, return_feats: bool = False
+    ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
+        if not return_feats:
+            return self.model(x)
+        feats: list[torch.Tensor] = []
+        for layer in self.model:
+            x = layer(x)
+            if isinstance(layer, nn.LeakyReLU):
+                feats.append(x)
+        return x, feats
