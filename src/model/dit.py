@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,33 +9,7 @@ from .embeddings import LabelEmbedder, PatchEmbed, TimestepEmbedder
 from .ffc import FFCEncoder
 from .hybrid import ConvDecoder, HoleRefine, ResConvBlock
 from .localglobal import LocalGlobalBlock, pooled_attn_bias, window_attn_bias
-
-
-def get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> torch.Tensor:
-    """Fixed 2D sin-cos positional embedding of shape ``(grid_size**2, embed_dim)``."""
-    grid_h = np.arange(grid_size, dtype=np.float64)
-    grid_w = np.arange(grid_size, dtype=np.float64)
-    grid = np.meshgrid(grid_w, grid_h)
-    grid = np.stack(grid, axis=0).reshape(2, 1, grid_size, grid_size)
-    pos_embed = _get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    return torch.from_numpy(pos_embed).float()
-
-
-def _get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
-    assert embed_dim % 2 == 0
-    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
-    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
-    return np.concatenate([emb_h, emb_w], axis=1)
-
-
-def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / (10000**omega)
-    pos = pos.reshape(-1)
-    out = np.einsum("m,d->md", pos, omega)
-    return np.concatenate([np.sin(out), np.cos(out)], axis=1)
+from .rope import build_2d_rope
 
 
 class DiffusionTransformer(nn.Module):
@@ -46,6 +19,7 @@ class DiffusionTransformer(nn.Module):
     Stage 2: main DiT trunk with interleaved cross-attention from the structure DiT.
     Stage 3: ``LocalGlobalBlock`` stack (windowed local + pooled global attention).
     Stage 4: residual conv head → hole refine.
+    Positions: 2D RoPE on q/k in every attention (no absolute position embedding).
 
     Main input stays stacked ``[x_t, mask, masked]`` (3 channels).
     Structure input is masked ``[edge, line, dot]`` (Canny / Hough / Shi-Tomasi).
@@ -91,6 +65,11 @@ class DiffusionTransformer(nn.Module):
             )
         if structure_depth < 1:
             raise ValueError(f"structure_depth must be >= 1, got {structure_depth}")
+        if hidden_size % num_heads != 0 or (hidden_size // num_heads) % 4 != 0:
+            raise ValueError(
+                f"hidden_size/num_heads ({hidden_size}/{num_heads}) must be an "
+                "integer divisible by 4 for 2D RoPE"
+            )
         if ffc_blocks < 0:
             raise ValueError(f"ffc_blocks must be >= 0, got {ffc_blocks}")
         if ffc_blocks > 0 and not (0.0 < float(ffc_ratio_global) < 1.0):
@@ -179,11 +158,17 @@ class DiffusionTransformer(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
 
-        num_patches = self.feat_embedder.num_patches
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-        self.structure_pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, hidden_size), requires_grad=False
+        head_dim = hidden_size // num_heads
+        rope_cos, rope_sin = build_2d_rope(grid_size, head_dim)
+        self.register_buffer("rope_cos", rope_cos, persistent=False)
+        self.register_buffer("rope_sin", rope_sin, persistent=False)
+        # Pooled global keys sit at the centres of their pool x pool token tiles.
+        pool_grid = grid_size // lg_pool if lg_blocks > 0 else 1
+        pool_cos, pool_sin = build_2d_rope(
+            pool_grid, head_dim, scale=float(lg_pool), offset=(lg_pool - 1) / 2.0
         )
+        self.register_buffer("rope_pool_cos", pool_cos, persistent=False)
+        self.register_buffer("rope_pool_sin", pool_sin, persistent=False)
 
         self.blocks = nn.ModuleList(
             [
@@ -262,13 +247,6 @@ class DiffusionTransformer(nn.Module):
                     nn.init.constant_(module.bias, 0)
 
         self.apply(_basic_init)
-
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1],
-            int(self.feat_embedder.num_patches**0.5),
-        )
-        self.pos_embed.data.copy_(pos_embed.unsqueeze(0))
-        self.structure_pos_embed.data.copy_(pos_embed.unsqueeze(0))
 
         for embedder in (
             self.feat_embedder,
@@ -352,7 +330,6 @@ class DiffusionTransformer(nn.Module):
             self.feat_embedder(feat)
             + self.mask_embedder(mask)
             + self.masked_embedder(masked)
-            + self.pos_embed
         )
 
         edge, line, dot = structure[:, 0:1], structure[:, 1:2], structure[:, 2:3]
@@ -362,7 +339,6 @@ class DiffusionTransformer(nn.Module):
             + self.edge_embedder(edge)
             + self.line_embedder(line)
             + self.dot_embedder(dot)
-            + self.structure_pos_embed
         )
 
         t_emb = self.t_embedder(t)
@@ -371,34 +347,42 @@ class DiffusionTransformer(nn.Module):
         patch_bias = self._patch_key_bias(mask)
         attn_bias = patch_bias.flatten(2).unsqueeze(2)
 
+        rope = (self.rope_cos, self.rope_sin)
+
         for block in self.structure_blocks:
-            struct_tokens = block(struct_tokens, c, attn_bias=attn_bias)
+            struct_tokens = block(struct_tokens, c, attn_bias=attn_bias, rope=rope)
 
         cross_i = 0
         for i, block in enumerate(self.blocks):
-            tokens = block(tokens, c, attn_bias=attn_bias)
+            tokens = block(tokens, c, attn_bias=attn_bias, rope=rope)
             if (
                 cross_i < len(self.cross_blocks)
                 and (i + 1) % self._cross_interval == 0
             ):
                 tokens = self.cross_blocks[cross_i](
-                    tokens, struct_tokens, c, attn_bias=attn_bias
+                    tokens, struct_tokens, c, attn_bias=attn_bias, rope=rope
                 )
                 cross_i += 1
 
         # If depth not divisible by structure_depth, apply remaining cross blocks.
         while cross_i < len(self.cross_blocks):
             tokens = self.cross_blocks[cross_i](
-                tokens, struct_tokens, c, attn_bias=attn_bias
+                tokens, struct_tokens, c, attn_bias=attn_bias, rope=rope
             )
             cross_i += 1
 
         if self.lg_blocks > 0:
             local_bias = window_attn_bias(patch_bias, self.lg_window)
             global_bias = pooled_attn_bias(patch_bias, self.lg_pool)
+            rope_global = (rope, (self.rope_pool_cos, self.rope_pool_sin))
             for block in self.lg_stage:
                 tokens = block(
-                    tokens, c, local_bias=local_bias, global_bias=global_bias
+                    tokens,
+                    c,
+                    local_bias=local_bias,
+                    global_bias=global_bias,
+                    rope_local=rope,
+                    rope_global=rope_global,
                 )
 
         h = self.final_layer(tokens, c)

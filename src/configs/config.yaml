@@ -53,9 +53,11 @@ training:
   # *_t_max_frac gates losses to t <= frac*T; 1.0 = every t, incl. infer_t = T-1
   struct_t_max_frac: 1.0
   # Adversarial
-  adv_weight: 0.05
+  adv_weight: 0.1
   adv_mse_threshold: 0.4
-  adv_t_max_frac: 1.0
+  adv_t_max_frac: 0.4
+  adaptive_adv: true      # scale adv by ||grad rec|| / ||grad adv|| at decoder.net[-1]
+  adv_lambda_max: 1.0e4
   fm_weight: 2.0          # D feature-matching L1 on adv-gated samples; 0 disables
   d_lr: 1.0e-4
   adv_real_label: 0.9
@@ -78,20 +80,20 @@ training:
 model:
   # Spatial / diffusion
   image_size: 256
-  patch_size: 8
+  patch_size: 4
   num_timesteps: 1000
   prediction: x0          # x0 | eps
   learn_sigma: false      # sigma channel gets no gradient without a VLB term
 
   # Stage 2: DiT backbone
-  hidden_size: 512
-  depth: 8                # main self-attn DiTBlock count
+  hidden_size: 256        # head_dim = hidden_size / num_heads must be divisible by 4 (2D RoPE)
+  depth: 4                # main self-attn DiTBlock count
   num_heads: 8
-  dropout: 0.05           # proj dropout; attention dropout stays 0
+  dropout: 0.2            # proj dropout; attention dropout stays 0
   mask_attn_bias: 4.0     # soft down-weight hole keys (MAT-style)
 
   # Structure stream (edge / line / dot) + cross-attn into main
-  structure_depth: 4      # structure DiTBlock + DiTCrossBlock count each
+  structure_depth: 2      # structure DiTBlock + DiTCrossBlock count each
 
   # Stage 1: FFC front-end (local conv + global Fourier) before patchify
   stem_channels: 64       # ConvStem out channels (main + structure)
@@ -101,8 +103,8 @@ model:
 
   # Stage 3: local (window) + global (pooled) attention
   lg_blocks: 2
-  lg_window: 4            # token-grid window side; grid is image_size/patch_size
-  lg_pool: 4              # token-grid pooling factor for global keys/values
+  lg_window: 8            # token-grid window side; grid is image_size/patch_size
+  lg_pool: 8              # token-grid pooling factor for global keys/values
 
   # Stage 4: conv output head
   mid_channels: 64        # unpatchify feature channels

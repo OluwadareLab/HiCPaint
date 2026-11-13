@@ -6,6 +6,7 @@ import torch.nn.functional as F
 
 from .blocks import modulate
 from .mlp import Mlp
+from .rope import Rope, apply_rope
 
 
 def _grid_size(num_tokens: int) -> int:
@@ -78,9 +79,10 @@ class WindowSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         b = x.shape[0]
-        xw, g, _ = window_partition(x, self.window)
+        xw, g, nw_side = window_partition(x, self.window)
         bw, n, c = xw.shape
         qkv = (
             self.qkv(xw)
@@ -88,6 +90,16 @@ class WindowSelfAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
+        if rope is not None:
+            nw = nw_side * nw_side
+            # Tables carry absolute grid positions, partitioned like the tokens.
+            cos, sin = (
+                window_partition(t.unsqueeze(0), self.window)[0].unsqueeze(1)
+                for t in rope
+            )
+            shape = (b, nw, self.num_heads, n, self.head_dim)
+            q = apply_rope(q.reshape(shape), cos, sin).reshape(bw, self.num_heads, n, -1)
+            k = apply_rope(k.reshape(shape), cos, sin).reshape(bw, self.num_heads, n, -1)
         if attn_bias is not None:
             attn_bias = attn_bias.to(dtype=q.dtype)
         out = F.scaled_dot_product_attention(
@@ -131,7 +143,9 @@ class PooledGlobalAttention(nn.Module):
         self,
         x: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: tuple[Rope, Rope] | None = None,
     ) -> torch.Tensor:
+        """``rope``: (full-grid table for queries, pooled-grid table for keys)."""
         b, n, c = x.shape
         g = _grid_size(n)
         if g % self.pool != 0:
@@ -147,6 +161,9 @@ class PooledGlobalAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         k, v = kv.unbind(0)
+        if rope is not None:
+            rope_q, rope_k = rope
+            q, k = apply_rope(q, *rope_q), apply_rope(k, *rope_k)
         if attn_bias is not None:
             attn_bias = attn_bias.to(dtype=q.dtype)
         out = F.scaled_dot_product_attention(
@@ -211,6 +228,8 @@ class LocalGlobalBlock(nn.Module):
         c: torch.Tensor,
         local_bias: torch.Tensor | None = None,
         global_bias: torch.Tensor | None = None,
+        rope_local: Rope | None = None,
+        rope_global: tuple[Rope, Rope] | None = None,
     ) -> torch.Tensor:
         (
             shift_loc,
@@ -226,10 +245,12 @@ class LocalGlobalBlock(nn.Module):
         x = x + gate_loc.unsqueeze(1) * self.local_attn(
             modulate(self.norm_local(x), shift_loc, scale_loc),
             attn_bias=local_bias,
+            rope=rope_local,
         )
         x = x + gate_glb.unsqueeze(1) * self.global_attn(
             modulate(self.norm_global(x), shift_glb, scale_glb),
             attn_bias=global_bias,
+            rope=rope_global,
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(
             modulate(self.norm_mlp(x), shift_mlp, scale_mlp)

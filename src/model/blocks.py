@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from .attention import BidirectionalSelfAttentionSDPA, CrossAttention
 from .mlp import Mlp
+from .rope import Rope
 
 
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -47,6 +48,7 @@ class DiTBlock(nn.Module):
         x: torch.Tensor,
         c: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
@@ -54,6 +56,7 @@ class DiTBlock(nn.Module):
         x = x + gate_msa.unsqueeze(1) * self.attn(
             modulate(self.norm1(x), shift_msa, scale_msa),
             attn_bias=attn_bias,
+            rope=rope,
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
@@ -99,6 +102,7 @@ class DiTCrossBlock(nn.Module):
         context: torch.Tensor,
         c: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=1)
@@ -107,6 +111,7 @@ class DiTCrossBlock(nn.Module):
             modulate(self.norm1(x), shift_msa, scale_msa),
             self.norm_ctx(context),
             attn_bias=attn_bias,
+            rope=rope,
         )
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x

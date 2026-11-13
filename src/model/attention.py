@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .rope import Rope, apply_rope
+
 
 class BidirectionalSelfAttention(nn.Module):
     """Full bidirectional multi-head self-attention (no causal mask)."""
@@ -29,6 +31,7 @@ class BidirectionalSelfAttention(nn.Module):
         self,
         x: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         b, n, c = x.shape
         qkv = (
@@ -37,6 +40,8 @@ class BidirectionalSelfAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
+        if rope is not None:
+            q, k = apply_rope(q, *rope), apply_rope(k, *rope)
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         if attn_bias is not None:
@@ -75,6 +80,7 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
         self,
         x: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         b, n, c = x.shape
         qkv = (
@@ -83,6 +89,8 @@ class BidirectionalSelfAttentionSDPA(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
+        if rope is not None:
+            q, k = apply_rope(q, *rope), apply_rope(k, *rope)
 
         if attn_bias is not None:
             attn_bias = attn_bias.to(dtype=q.dtype)
@@ -127,6 +135,7 @@ class CrossAttention(nn.Module):
         x: torch.Tensor,
         context: torch.Tensor,
         attn_bias: torch.Tensor | None = None,
+        rope: Rope | None = None,
     ) -> torch.Tensor:
         b, n, c = x.shape
         m = context.shape[1]
@@ -137,6 +146,8 @@ class CrossAttention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         k, v = kv.unbind(0)
+        if rope is not None:
+            q, k = apply_rope(q, *rope), apply_rope(k, *rope)
 
         if attn_bias is not None:
             attn_bias = attn_bias.to(dtype=q.dtype)

@@ -24,6 +24,7 @@ Thumbs.db
 
 # Training / inference outputs (checkpoints, logs, viz, metrics)
 output/
+output*/
 *.pt
 *.pth
 *.ckpt

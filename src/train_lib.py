@@ -201,6 +201,8 @@ class LossConfig:
     struct_t_max_frac: float = 1.0
     adv_weight: float = 0.05
     adv_t_max_frac: float = 1.0
+    adaptive_adv: bool = False
+    adv_lambda_max: float = 1.0e4
     fm_weight: float = 0.0
     min_snr_gamma: float = 0.0
     high_t_bias: float = 0.0
@@ -270,6 +272,19 @@ def evaluate(
     return metrics
 
 
+def _adaptive_adv_lambda(
+    loss_rec: torch.Tensor,
+    loss_adv: torch.Tensor,
+    last_weight: torch.Tensor,
+    lam_max: float,
+) -> torch.Tensor:
+    """VQGAN-style ``||grad rec|| / ||grad adv||`` at the generator's last layer."""
+    g_rec = torch.autograd.grad(loss_rec, last_weight, retain_graph=True)[0]
+    g_adv = torch.autograd.grad(loss_adv, last_weight, retain_graph=True)[0]
+    lam = g_rec.norm() / (g_adv.norm() + 1.0e-4)
+    return lam.clamp(0.0, lam_max).detach()
+
+
 def train_one_epoch(
     model: nn.Module,
     disc: nn.Module,
@@ -322,6 +337,7 @@ def train_one_epoch(
             "dist",
             "spec",
             "adv_g",
+            "adv_lam",
             "fm",
             "adv_d",
             "total",
@@ -421,7 +437,7 @@ def train_one_epoch(
         else:
             loss_adv_g = zero
 
-        loss_g = (
+        loss_rec = (
             cfg.charbonnier_weight * loss_base
             + cfg.x0_l1_weight * loss_x0_l1
             + cfg.ssim_weight * loss_ssim
@@ -430,7 +446,18 @@ def train_one_epoch(
             + cfg.grad_weight * loss_grad
             + cfg.dist_weight * loss_dist
             + cfg.spectral_weight * loss_spec
-            + cfg.adv_weight * loss_adv_g
+        )
+        adv_lam = pred.new_ones(())
+        if use_adv and cfg.adaptive_adv and float(adv_w.sum()) > 0:
+            adv_lam = _adaptive_adv_lambda(
+                loss_rec,
+                loss_adv_g,
+                unwrap_model(model).decoder.net[-1].weight,
+                cfg.adv_lambda_max,
+            )
+        loss_g = (
+            loss_rec
+            + cfg.adv_weight * adv_lam * loss_adv_g
             + cfg.fm_weight * loss_fm
         )
         loss_g.backward()
@@ -473,6 +500,7 @@ def train_one_epoch(
             "dist": loss_dist,
             "spec": loss_spec,
             "adv_g": loss_adv_g,
+            "adv_lam": adv_lam,
             "fm": loss_fm,
             "adv_d": loss_d,
             "total": loss_g,
@@ -723,6 +751,8 @@ def train(args: argparse.Namespace) -> None:
         struct_t_max_frac=float(args.struct_t_max_frac),
         adv_weight=float(args.adv_weight),
         adv_t_max_frac=float(args.adv_t_max_frac),
+        adaptive_adv=bool(args.adaptive_adv),
+        adv_lambda_max=float(args.adv_lambda_max),
         fm_weight=float(args.fm_weight),
         min_snr_gamma=float(args.min_snr_gamma),
         high_t_bias=float(args.high_t_bias),
@@ -754,6 +784,7 @@ def train(args: argparse.Namespace) -> None:
             f"spectral_weight={args.spectral_weight} "
             f"struct_t_max_frac={args.struct_t_max_frac} "
             f"adv_weight={args.adv_weight} adv_t_max_frac={args.adv_t_max_frac} "
+            f"adaptive_adv={int(args.adaptive_adv)} adv_lambda_max={args.adv_lambda_max} "
             f"fm_weight={args.fm_weight} d_r1_gamma={args.d_r1_gamma} "
             f"d_r1_every={args.d_r1_every} "
             f"adv_mse_threshold={args.adv_mse_threshold} ssim_weight={args.ssim_weight} "
@@ -999,6 +1030,7 @@ def train(args: argparse.Namespace) -> None:
                 f"train_dist={metrics.get('train_dist', 0.0):.6f} "
                 f"train_spec={metrics.get('train_spec', 0.0):.6f} "
                 f"train_adv_g={metrics.get('train_adv_g', 0.0):.6f} "
+                f"train_adv_lam={metrics.get('train_adv_lam', 0.0):.4f} "
                 f"train_fm={metrics.get('train_fm', 0.0):.6f} "
                 f"train_adv_d={metrics.get('train_adv_d', 0.0):.6f} "
                 f"ssim_unlocked={int(ssim_unlocked)} "
@@ -1353,6 +1385,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
         type=float,
         default=d["adv_t_max_frac"],
         help="Apply adversarial loss only for samples with t < frac * num_timesteps.",
+    )
+    p.add_argument(
+        "--adaptive-adv",
+        action=argparse.BooleanOptionalAction,
+        default=d["adaptive_adv"],
+        help="Scale adv loss by ||grad rec|| / ||grad adv|| at the decoder's last layer.",
+    )
+    p.add_argument(
+        "--adv-lambda-max",
+        type=float,
+        default=d["adv_lambda_max"],
+        help="Upper clamp for the adaptive adversarial scale.",
     )
     p.add_argument(
         "--fm-weight",
